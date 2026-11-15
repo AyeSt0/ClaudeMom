@@ -676,6 +676,7 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
 
       <details className="cm-more">
         <summary>高级</summary>
+        <Toggle checked={config.cowork ?? true} detail="关掉后按 Claude 自己的开关，新版 Claude 通常只剩 Chat / Code。系统条件（Windows 需商店版、虚拟化可用）仍由 Claude 检查" disabled={disabled} label="Cowork" onChange={(next) => onConfigure({ cowork: next })} />
         <Toggle checked={config.hideUnroutedModels ?? true} detail="Claude 自带的 Opus / Sonnet 等条目会被换成默认模型" disabled={disabled} label="只显示上游的模型" onChange={(next) => onConfigure({ hideUnroutedModels: next })} />
         <Toggle checked={config.computerUse} detail="需要系统的 Spotlight 正常工作，否则 Claude 会卡住" disabled={disabled} label="电脑控制" onChange={(next) => onConfigure({ computerUse: next })} />
         <Toggle checked={config.backgroundMode} disabled={disabled} label="后台模式" onChange={(next) => onConfigure(next ? { backgroundMode: true } : { backgroundMode: false, forceBackgroundMode: false })} />

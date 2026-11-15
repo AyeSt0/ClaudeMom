@@ -1697,6 +1697,7 @@ fn start_backend(
         .env("CLAUDE_LOCAL_COMPUTER_USE", flag(config.computer_use))
         .env("CLAUDE_LOCAL_BACKGROUND_MODE", flag(config.background_mode))
         .env("CLAUDE_LOCAL_FORCE_BACKGROUND_MODE", flag(config.force_background_mode))
+        .env("CLAUDE_LOCAL_COWORK", flag(config.cowork))
         .env("CLAUDE_LOCAL_HIDE_UNROUTED_MODELS", flag(config.hide_unrouted_models))
         .env("CLAUDE_LOCAL_DISPLAY_NAME", config.effective_display_name())
         .env("CLAUDE_LOCAL_EMAIL", config.effective_email())
@@ -3294,6 +3295,10 @@ RGvMS5OzZFvnFlekIHE6c+6QK9QtWD7P+PkIpRa1D01cb9SwsRHqGfs7o2UbaZxs\n\
         assert_eq!(value["voiceInput"], true);
         assert_eq!(value["backgroundMode"], true);
         assert_eq!(value["forceBackgroundMode"], false);
+        assert_eq!(value["cowork"], true);
+        // 旧版设置文件没有 cowork 字段：按默认开。
+        let legacy: ClaudeLocalSettings = serde_json::from_value(json!({ "enabled": true })).unwrap();
+        assert!(legacy.cowork);
         // 强制后台模式会连带打开后台模式和电脑控制。
         let forced = validate_config(ClaudeLocalSettings {
             force_background_mode: true,

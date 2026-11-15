@@ -347,6 +347,99 @@ test("installed template fetches the first shell through the configured upstream
   }
 });
 
+test("unpacked ion-dist directory is served when the Claude build ships no ASAR", async () => {
+  // 部分 Claude 版本把前端解包成 resources/ion-dist/，没有 ion-dist.asar（issue #5）。
+  const resourcesDir = path.join(root, "unpacked-resources");
+  const dist = path.join(resourcesDir, "ion-dist");
+  fs.mkdirSync(path.join(dist, "assets", "v1"), { recursive: true });
+  fs.mkdirSync(path.join(dist, "i18n", "dynamic"), { recursive: true });
+  fs.mkdirSync(path.join(dist, "private"), { recursive: true });
+  fs.writeFileSync(path.join(dist, "index.html"), '<!doctype html><html data-build-id="unpacked-build"><head></head><body></body></html>');
+  fs.writeFileSync(path.join(dist, "assets", "v1", "main.js"), "export const unpacked = true;");
+  fs.writeFileSync(path.join(dist, "i18n", "en-US.json"), "{}");
+  fs.writeFileSync(path.join(dist, "i18n", "dynamic", "en-US.json"), "{}");
+  fs.writeFileSync(path.join(dist, "secret.txt"), "must-not-leak");
+  fs.writeFileSync(path.join(dist, "private", "x.js"), "must-not-leak");
+  let linked = false;
+  try {
+    fs.symlinkSync(path.join(dist, "secret.txt"), path.join(dist, "assets", "v1", "link.js"));
+    linked = true;
+  } catch { /* Windows 无权限建符号链接时跳过这一项 */ }
+
+  const resources = createOfficialAssets(resourcesDir);
+  try {
+    assert.equal(resources.buildId, "unpacked-build");
+    assert.deepEqual(resources.i18nLocales, ["en-US"]);
+    assert.equal(resources.archivePath, fs.realpathSync(dist));
+    const asset = resources.read("/assets/v1/main.js");
+    assert.equal(asset.body.toString("utf8"), "export const unpacked = true;");
+    assert.equal(asset.contentType, "text/javascript; charset=utf-8");
+    assert.equal(resources.read("/index.html").isHtml, true);
+    assert.equal(resources.read("/secret.txt"), null);
+    assert.equal(resources.read("/private/x.js"), null);
+    assert.equal(resources.read("/assets/%2e%2e%2fsecret.txt"), null);
+    assert.equal(resources.read("/assets/../secret.txt"), null);
+    if (linked) assert.equal(resources.read("/assets/v1/link.js"), null);
+    // 运行中被删掉的文件按缺失处理，不抛错。
+    fs.rmSync(path.join(dist, "assets", "v1", "main.js"));
+    assert.equal(resources.read("/assets/v1/main.js"), null);
+  } finally {
+    resources.close();
+  }
+
+  // asar 与目录都在时以 asar 为准；两者都没有时报出清楚的错误。
+  const both = path.join(root, "both-resources");
+  fs.cpSync(resourcesDir, both, { recursive: true, verbatimSymlinks: true });
+  fs.copyFileSync(path.join(root, "desktop-resources", "ion-dist.asar"), path.join(both, "ion-dist.asar"));
+  const preferred = createOfficialAssets(both);
+  assert.equal(preferred.buildId, "fixture-build");
+  preferred.close();
+  const empty = path.join(root, "empty-resources");
+  fs.mkdirSync(empty, { recursive: true });
+  assert.throws(() => createOfficialAssets(empty), /neither ion-dist\.asar nor ion-dist/);
+
+  // 整个托管代理用解包目录也能起来，并回官方外壳。
+  fs.writeFileSync(path.join(dist, "assets", "v1", "main.js"), "export const unpacked = true;");
+  const instance = await start({ CLAUDE_LOCAL_DESKTOP_RESOURCES: resourcesDir });
+  try {
+    const shell = await request(instance, "/new", { host: "claude.ai" });
+    assert.equal(shell.status, 200);
+    assert.match(shell.bytes.toString("utf8"), /data-build-id="unpacked-build"/);
+    const asset = await request(instance, "/assets/v1/main.js", { host: "claude.ai" });
+    assert.equal(asset.bytes.toString("utf8"), "export const unpacked = true;");
+  } finally {
+    await stop(instance);
+  }
+});
+
+test("installed template turns on the Cowork GrowthBook gate unless disabled", async () => {
+  // 录制模板里 yukon_silver（574905726）是 false，新版 Claude 只显示 Chat / Code（issue #4）。
+  const runtimeDir = path.join(root, "cowork-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
+  fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
+    org_growthbook: {
+      hashing_algorithm: "djb2",
+      features: { "574905726": { defaultValue: false }, "577907085": { defaultValue: true } },
+    },
+  }));
+  const env = { CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache") };
+  const features = async (extra) => {
+    const instance = await start({ ...env, ...extra }, runtimeDir);
+    try {
+      return (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json.org_growthbook;
+    } finally {
+      await stop(instance);
+    }
+  };
+  const on = await features({});
+  assert.deepEqual(on.features["574905726"], { defaultValue: true });
+  assert.deepEqual(on.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
+  assert.equal(on.hashing_algorithm, "djb2");
+  const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
+  assert.deepEqual(off.features["574905726"], { defaultValue: false });
+});
+
 test("clean managed runtime uses synthetic bootstrap and configured catalogs without private recordings", async () => {
   for (const pathname of ["/edge-api/bootstrap", "/api/bootstrap", "/api/bootstrap/local/app_start"]) {
     const result = await request(service, pathname, { host: "claude.ai" });

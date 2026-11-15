@@ -42,6 +42,8 @@ export type ClaudeConfig = {
   backgroundMode: boolean;
   /** 无视 Claude 对后台模式的 macOS 版本上限。 */
   forceBackgroundMode?: boolean;
+  /** 打开 Cowork 的总开关（默认开）。 */
+  cowork?: boolean;
   displayName?: string;
   email?: string;
   plan?: string;

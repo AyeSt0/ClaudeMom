@@ -698,6 +698,19 @@ function mockEdgeApi(req, res, url) {
   return json(res, {});
 }
 
+// Cowork 总开关：GrowthBook 功能 `yukon_silver`，id 是功能名的 Java hashCode（574905726）。
+// 录制模板里它是 false，新版 Claude 因此只显示 Chat / Code。必须在模板合并之后改写，
+// 否则模板的 false 会盖掉。id 的算法跟模板走：只改写模板自带的 GrowthBook 表，
+// 合成兜底（localBootstrap 的空表）的 hashing_algorithm 不同，不往里塞。
+const COWORK_FEATURE_ID = "574905726";
+function forceCowork(result, template) {
+  if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
+  result.org_growthbook = {
+    ...result.org_growthbook,
+    features: { ...result.org_growthbook.features, [COWORK_FEATURE_ID]: { defaultValue: true } },
+  };
+}
+
 let resolvedBootstrapCache;
 function resolvedBootstrap() {
   if (resolvedBootstrapCache) return resolvedBootstrapCache;
@@ -713,6 +726,7 @@ function resolvedBootstrap() {
     ...result.served_copy,
     "web.plan_name.max_20x": runtime.localization ? "Codex++ 本地网关" : "Codex++ local gateway",
   };
+  if (runtime.cowork) forceCowork(result, template);
   mergePoolModels(result);
   resolvedBootstrapCache = result;
   return result;
