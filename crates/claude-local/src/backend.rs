@@ -2978,7 +2978,8 @@ server.listen(0,'127.0.0.1',()=>{
         let switched = read_json(&state.join(SWITCH_STATE_FILE));
         assert_eq!(switched["mode"], json!("3p"));
         // 记下的是用户最初的值，不是中间那次 1p。
-        let main_config = support.join("Claude/claude_desktop_config.json").to_string_lossy().into_owned();
+        // 和产品代码一样逐段 join：Windows 上 "Claude/claude_desktop_config.json" 拼出来的分隔符对不上记录里的键。
+        let main_config = support.join("Claude").join("claude_desktop_config.json").to_string_lossy().into_owned();
         assert_eq!(switched["deploymentMode"][main_config.as_str()], json!("3p"));
         apply_real_profile_one_p(&sets, &state).unwrap();
         assert!(!support.join("Claude-3p/configLibrary").exists(), "回到完整功能模式时删掉第三方模式的配置");
