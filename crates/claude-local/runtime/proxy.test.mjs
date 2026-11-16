@@ -793,6 +793,15 @@ test("model requests strip diagnostics and preserve the rest of the payload", as
   assert.deepEqual(gatewayRequests.at(-1), { path: "/v1/messages?beta=true", body: payload });
 });
 
+for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
+  test(`policy limits keep the object shape the desktop validator expects over ${host || "direct HTTP"}`, async () => {
+    const result = await request("/api/claude_code/policy_limits", { host });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body.restrictions, {});
+    assert.deepEqual(result.body.compliance_taints, []);
+  });
+}
+
 test("document navigations replay the app shell rather than logged-out landing stubs", async () => {
   const cacheWrite = (key, body, meta) => {
     const cp = path.join(dictationCacheDir, crypto.createHash("sha1").update(key).digest("hex"));
