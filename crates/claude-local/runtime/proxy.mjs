@@ -22,6 +22,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
@@ -102,6 +103,10 @@ const POC_I18N = path.join(POC_DIR ?? here, "i18n");
 // 托管模式在存在 PoC 数据（dev 录制目录或安装的内嵌 mock 模板）时走 PoC 数据路径；
 // 完全没有模板数据时保持合成兜底（officialShell/localBootstrap + 状态告警）。
 const dataManaged = runtime.managed && !POC_DIR;
+// 页面外壳用本机 Claude 自带的版本（ion-dist）：资源都在本地，不用每逢线上换版本就补拉上千个文件，
+// 首次启动也不依赖能连上 claude.ai。没有模板时本来就这样；有模板时由 localShell 开关决定，
+// 关掉则沿用线上外壳（首次经出站代理抓取后写穿缓存）。
+const useOfficialShell = Boolean(officialShell) && (dataManaged || runtime.localShell);
 const READ_CACHE = POC_DIR ? path.join(POC_DIR, ".cache") : CACHE_DIR;
 const LOG = arg("log", "1") !== "0";
 const READY_FILE = process.env.CLAUDE_LOCAL_READY_FILE;
@@ -727,6 +732,11 @@ function resolvedBootstrap() {
     "web.plan_name.max_20x": runtime.localization ? "Codex++ 本地网关" : "Codex++ local gateway",
   };
   if (runtime.cowork) forceCowork(result, template);
+  if (useOfficialShell) {
+    // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
+    result.gated_imports = {};
+    result.gated_imports_build_id = officialAssets.buildId;
+  }
   mergePoolModels(result);
   resolvedBootstrapCache = result;
   return result;
@@ -1424,42 +1434,108 @@ function isLoopbackHost(hostname) {
   return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(String(hostname).toLowerCase());
 }
 
-/** 发往上游网页的请求：https 且配置了出站代理时先 CONNECT 打通隧道，再在隧道上做 TLS。 */
-function upstreamRequest(target, options, callback) {
-  const client = target.protocol === "http:" ? http : https;
-  if (!UPSTREAM_PROXY || target.protocol !== "https:" || isLoopbackHost(target.hostname)) {
-    return client.request(options, callback);
-  }
-  const port = Number(options.port || 443);
-  const authority = `${options.hostname}:${port}`;
-  const proxyAuth = UPSTREAM_PROXY.username
+function upstreamProxyAuth() {
+  return UPSTREAM_PROXY?.username
     ? { "proxy-authorization": `Basic ${Buffer.from(`${decodeURIComponent(UPSTREAM_PROXY.username)}:${decodeURIComponent(UPSTREAM_PROXY.password)}`).toString("base64")}` }
     : {};
-  return https.request({
-    ...options,
-    agent: undefined,
-    // ClientRequest 支持回调式 createConnection：隧道建好后再交出 TLS socket。
-    createConnection: (_options, done) => {
-      const connect = http.request({
-        host: UPSTREAM_PROXY.hostname,
-        port: Number(UPSTREAM_PROXY.port || 80),
-        method: "CONNECT",
-        path: authority,
-        headers: { host: authority, ...proxyAuth },
-        timeout: options.timeout || 20000,
-      });
-      connect.once("connect", (response, socket) => {
-        if (response.statusCode !== 200) {
-          socket.destroy();
-          return done(new Error(`upstream proxy CONNECT ${response.statusCode}`));
-        }
-        done(null, tls.connect({ socket, servername: options.hostname }));
-      });
-      connect.once("timeout", () => connect.destroy(new Error("upstream proxy timeout")));
-      connect.once("error", (error) => done(error));
-      connect.end();
-    },
-  }, callback);
+}
+
+// 发往上游网页的请求共用连接池：首次启动（或线上页面换版本后）要补拉上千个前端资源，
+// 逐个新建连接会在代理软件 / 防火墙里刷出上千条 node 连接。每个主机最多并发这么多条，
+// 用完的连接留着复用，空闲一段时间后关掉。
+const UPSTREAM_MAX_SOCKETS_PER_HOST = 16;
+const UPSTREAM_IDLE_SOCKET_MS = 30_000;
+const UPSTREAM_POOL = { keepAlive: true, maxSockets: UPSTREAM_MAX_SOCKETS_PER_HOST, timeout: UPSTREAM_IDLE_SOCKET_MS };
+
+/** 隧道还没打通时先替它收着 TLS 握手数据；打通后接上，两边原样转发。 */
+class PendingTunnel extends Duplex {
+  constructor() {
+    super();
+    this.socket = null;
+    this.queued = [];
+    this.finalCallback = null;
+  }
+  attach(socket) {
+    if (this.destroyed) return socket.destroy();
+    this.socket = socket;
+    socket.on("data", (chunk) => {
+      if (!this.push(chunk)) socket.pause();
+    });
+    socket.once("end", () => this.push(null));
+    socket.once("error", (error) => this.destroy(error));
+    socket.once("close", () => this.destroy());
+    for (const [chunk, encoding, callback] of this.queued) socket.write(chunk, encoding, callback);
+    this.queued = [];
+    if (this.finalCallback) {
+      socket.end();
+      this.finalCallback();
+    }
+  }
+  _read() {
+    this.socket?.resume();
+  }
+  _write(chunk, encoding, callback) {
+    if (this.socket) this.socket.write(chunk, encoding, callback);
+    else this.queued.push([chunk, encoding, callback]);
+  }
+  _final(callback) {
+    if (this.socket) {
+      this.socket.end();
+      callback();
+    } else {
+      this.finalCallback = callback;
+    }
+  }
+  _destroy(error, callback) {
+    this.socket?.destroy();
+    callback(error);
+  }
+}
+
+/**
+ * 经出站代理的连接池：新连接先 CONNECT 打通隧道，再在隧道上做 TLS；建好的连接照常复用。
+ * createConnection 必须同步交出 socket，连接池才会立刻把它计入 maxSockets
+ * （回调式异步交出时，隧道打通前的并发请求每个都会再开一条）。
+ */
+class UpstreamTunnelAgent extends https.Agent {
+  createConnection(options) {
+    const host = options.hostname || options.host;
+    const authority = `${host}:${Number(options.port || 443)}`;
+    const tunnel = new PendingTunnel();
+    const connect = http.request({
+      host: UPSTREAM_PROXY.hostname,
+      port: Number(UPSTREAM_PROXY.port || 80),
+      method: "CONNECT",
+      path: authority,
+      headers: { host: authority, ...upstreamProxyAuth() },
+      agent: false,
+      timeout: 20000,
+    });
+    connect.once("connect", (response, socket, head) => {
+      if (response.statusCode !== 200) {
+        socket.destroy();
+        return tunnel.destroy(new Error(`upstream proxy CONNECT ${response.statusCode}`));
+      }
+      if (head?.length) socket.unshift(head);
+      tunnel.attach(socket);
+    });
+    connect.once("timeout", () => connect.destroy(new Error("upstream proxy timeout")));
+    connect.once("error", (error) => tunnel.destroy(error));
+    // 请求方先放弃（TLS 连接被销毁）时，没打通的 CONNECT 一并取消。
+    tunnel.once("close", () => connect.destroy());
+    connect.end();
+    return tls.connect({ socket: tunnel, servername: options.servername || host });
+  }
+}
+
+const directAgent = new https.Agent(UPSTREAM_POOL);
+const tunnelAgent = UPSTREAM_PROXY ? new UpstreamTunnelAgent(UPSTREAM_POOL) : null;
+
+/** 发往上游网页的请求：https 走连接池，配置了出站代理时经代理隧道（本机地址一律直连）。 */
+function upstreamRequest(target, options, callback) {
+  if (target.protocol !== "https:") return http.request(options, callback);
+  const viaProxy = tunnelAgent && !isLoopbackHost(target.hostname);
+  return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
 }
 
 function proxyUpstream(req, res, url) {
@@ -1476,6 +1552,9 @@ function proxyUpstream(req, res, url) {
   const headers = { ...req.headers, host: url.host || target.host };
   delete headers["proxy-connection"];
   delete headers["accept-encoding"];
+  // 逐跳头只管 Claude 与本代理之间那一段；转给上游会让它每回一个请求就关连接，连接池复用不了。
+  delete headers.connection;
+  delete headers["keep-alive"];
 
   const upstreamReq = upstreamRequest(
     target,
@@ -1597,7 +1676,8 @@ function handle(req, res, hostHeader) {
   }
 
   const officialResourcePath = (() => {
-    if (!dataManaged || !["GET", "HEAD"].includes(req.method)) return null;
+    // 外壳用本机版本时，它引用的静态资源也从本机资源包出（见 useOfficialShell）。
+    if (!useOfficialShell || !["GET", "HEAD"].includes(req.method)) return null;
     const mapI18nPath = (pathname) => {
       const match = pathname.match(/^\/i18n\/(?:(s|dynamic)\/)?([a-zA-Z-]+)\.json$/);
       if (!match) return pathname;
@@ -1652,9 +1732,9 @@ function handle(req, res, hostHeader) {
     }
   }
 
-  // Fresh受管profile直接使用安装包内同一版本的官方SPA和静态资源，不依赖旧HTML录制缓存。
+  // 受管 profile 直接使用安装包内同一版本的官方SPA和静态资源，不依赖旧HTML录制缓存（见 useOfficialShell）。
   if (
-    dataManaged &&
+    useOfficialShell &&
     MODE === "mock" &&
     isMainClaudeHost &&
     req.method === "GET" &&
@@ -2179,6 +2259,79 @@ const MITM_HOSTS = runtime.managed
   ? /(^|\.)(claude\.ai|claude\.com|anthropic\.com)$/i
   : /(^|\.)(claude\.ai|claude\.com|anthropic\.com|ccbobi\.com)$/i;
 
+const PASS_THROUGH_CONNECT_TIMEOUT_MS = 15_000;
+
+// 非 claude 域名的 TCP 隧道。Claude 被 --proxy-server 指到本代理后，这些域名（统计、错误上报、
+// 第三方 CDN 等）也都经过这里：
+// - Claude 一侧关闭（含 RST）或任一侧出错：两侧立即一起关。只看上游出错会把上游连接一直留着。
+// - 上游正常关闭：交给 pipe 把剩余数据写完再关 Claude 一侧，不截断。
+// - 连不上的目标限时放弃；Claude 先放弃时同时取消还没连上的连接，不在后台继续连。
+// - 配了出站代理时经它 CONNECT：系统代理对 Claude 已失效，直连在受限网络里连不上，越积越多。
+function passThrough(clientSocket, host, port, head) {
+  let upstream = null;
+  let pending = null;
+  let open = false;
+  let done = false;
+  const teardown = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    pending?.destroy();
+    upstream?.destroy();
+    clientSocket.destroy();
+  };
+  const timer = setTimeout(teardown, PASS_THROUGH_CONNECT_TIMEOUT_MS);
+  clientSocket.once("close", teardown);
+  // CONNECT 交过来的 socket 没人读，Claude 断开时这里收不到 FIN/RST。隧道建好前先读着：
+  // 早到的数据暂存，建好后补发；Claude 在这期间关掉就立刻取消。
+  const early = [];
+  const onEarlyData = (chunk) => early.push(chunk);
+  const onEarlyEnd = () => teardown();
+  clientSocket.on("data", onEarlyData);
+  clientSocket.once("end", onEarlyEnd);
+  const attach = (socket) => {
+    upstream = socket;
+    socket.on("error", teardown);
+    socket.once("close", (hadError) => {
+      if (hadError || !open) teardown();
+    });
+  };
+  const established = (upstreamHead) => {
+    if (done) return;
+    open = true;
+    clearTimeout(timer);
+    clientSocket.off("data", onEarlyData);
+    clientSocket.off("end", onEarlyEnd);
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (upstreamHead?.length) clientSocket.write(upstreamHead);
+    if (head?.length) upstream.write(head);
+    for (const chunk of early) upstream.write(chunk);
+    upstream.pipe(clientSocket);
+    clientSocket.pipe(upstream);
+  };
+
+  if (UPSTREAM_PROXY && !isLoopbackHost(host)) {
+    const authority = `${host}:${port}`;
+    pending = http.request({
+      host: UPSTREAM_PROXY.hostname,
+      port: Number(UPSTREAM_PROXY.port || 80),
+      method: "CONNECT",
+      path: authority,
+      headers: { host: authority, ...upstreamProxyAuth() },
+    });
+    pending.once("connect", (response, socket, upstreamHead) => {
+      pending = null;
+      attach(socket);
+      if (response.statusCode !== 200) return teardown();
+      established(upstreamHead);
+    });
+    pending.once("error", teardown);
+    pending.end();
+    return;
+  }
+  attach(net.connect(Number(port), host, () => established()));
+}
+
 outer.on("connect", (req, clientSocket, head) => {
   noteClient();
   clientSocket.on("error", () => {});
@@ -2186,14 +2339,7 @@ outer.on("connect", (req, clientSocket, head) => {
   // 非 claude 域名：TCP 直通，不终止 TLS（保证 CDN / 其他服务不受影响）
   if (!MITM_HOSTS.test(host)) {
     log(`PASS-THROUGH CONNECT ${host}:${port}`);
-    const upstream = net.connect(Number(port), host, () => {
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head?.length) upstream.write(head);
-      upstream.pipe(clientSocket);
-      clientSocket.pipe(upstream);
-    });
-    upstream.on("error", () => clientSocket.destroy());
-    return;
+    return passThrough(clientSocket, host, port, head);
   }
   clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
   const tlsSocket = new tls.TLSSocket(clientSocket, {

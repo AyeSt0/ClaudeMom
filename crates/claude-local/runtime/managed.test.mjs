@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import https from "node:https";
 import os from "node:os";
 import path from "node:path";
@@ -347,6 +348,102 @@ test("installed template fetches the first shell through the configured upstream
   }
 });
 
+test("installed template serves the local official shell when the experimental switch is on", async () => {
+  // 线上外壳引用的资源与本机 ion-dist 对不上，首次启动会补拉上千个文件；实验开关打开时改用本机外壳。
+  const connects = [];
+  const upstreamProxy = http.createServer();
+  upstreamProxy.on("connect", (req, socket) => {
+    connects.push(req.url);
+    socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  const runtimeDir = path.join(root, "local-shell-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
+  fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
+    gated_imports_build_id: "online-build",
+    gated_imports: { "online-module": { preload: ["online-chunk.js"] } },
+  }));
+  const instance = await start({
+    CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"),
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+    CLAUDE_LOCAL_LOCAL_SHELL: "1",
+  }, runtimeDir);
+  try {
+    for (const pathname of ["/new", "/settings/general"]) {
+      const shell = await request(instance, pathname, { host: "claude.ai" });
+      assert.equal(shell.status, 200);
+      assert.match(shell.bytes.toString("utf8"), /data-build-id="fixture-build"/);
+    }
+    const asset = await request(instance, "/claude-ai/v2/assets/v1/main.js", { host: "assets-proxy.anthropic.com" });
+    assert.equal(asset.bytes.toString("utf8"), "export const localOfficialAsset = true;");
+    // 模板里线上版本的分块清单换成本机版本，否则客户端会去拉对不上的分块。
+    const bootstrap = await request(instance, "/edge-api/bootstrap", { host: "claude.ai" });
+    assert.equal(bootstrap.json.gated_imports_build_id, "fixture-build");
+    assert.deepEqual(bootstrap.json.gated_imports, {});
+    assert.deepEqual(connects, [], "本机外壳不需要联网");
+  } finally {
+    await stop(instance);
+    upstreamProxy.close();
+  }
+});
+
+test("upstream fetches share a bounded, reused connection pool through the upstream proxy", async () => {
+  // 首次启动要补拉上千个资源：之前每个请求单独 CONNECT 一条隧道，代理软件里刷出上千条 node 连接。
+  const tlsServer = https.createServer({
+    key: fs.readFileSync(path.join(here, "ca/server.key")),
+    cert: fs.readFileSync(path.join(here, "ca/server.crt")),
+  }, async (req, res) => {
+    await delay(20);
+    res.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-store" });
+    res.end(`// ${req.url}`);
+  });
+  tlsServer.listen(0, "127.0.0.1");
+  await once(tlsServer, "listening");
+  const connects = [];
+  const upstreamProxy = http.createServer();
+  upstreamProxy.on("connect", (req, socket, head) => {
+    connects.push(req.url);
+    socket.on("error", () => {});
+    const target = net.connect(tlsServer.address().port, "127.0.0.1", () => {
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head?.length) target.write(head);
+      target.pipe(socket);
+      socket.pipe(target);
+    });
+    target.on("error", () => socket.destroy());
+    socket.once("close", () => target.destroy());
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  const instance = await start({
+    CLAUDE_LOCAL_CACHE_DIR: path.join(root, "pool-cache"),
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+    NODE_EXTRA_CA_CERTS: path.join(here, "ca/ca.pem"),
+  });
+  try {
+    // 本机资源包里没有的 CDN 资源会转发上游。
+    const fetchAsset = (name) => request(instance, `/claude-ai/v2/assets/v1/${name}.js`, { host: "assets-proxy.anthropic.com" });
+    const burst = await Promise.all(Array.from({ length: 60 }, (_, i) => fetchAsset(`burst-${i}`)));
+    for (const [i, response] of burst.entries()) {
+      assert.equal(response.status, 200);
+      assert.equal(response.bytes.toString("utf8"), `// /claude-ai/v2/assets/v1/burst-${i}.js`);
+    }
+    assert.ok(connects.length <= 16, `60 个并发请求开了 ${connects.length} 条隧道，应不超过 16`);
+    assert.ok(connects.every((target) => target === "assets-proxy.anthropic.com:443"));
+    const opened = connects.length;
+    for (let i = 0; i < 5; i++) assert.equal((await fetchAsset(`later-${i}`)).status, 200);
+    assert.equal(connects.length, opened, "之后的请求复用已有连接，不再新开隧道");
+  } finally {
+    await stop(instance);
+    upstreamProxy.closeAllConnections();
+    upstreamProxy.close();
+    tlsServer.closeAllConnections();
+    tlsServer.close();
+  }
+});
+
 test("unpacked ion-dist directory is served when the Claude build ships no ASAR", async () => {
   // 部分 Claude 版本把前端解包成 resources/ion-dist/，没有 ion-dist.asar（issue #5）。
   const resourcesDir = path.join(root, "unpacked-resources");
@@ -438,6 +535,115 @@ test("installed template turns on the Cowork GrowthBook gate unless disabled", a
   assert.equal(on.hashing_algorithm, "djb2");
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
   assert.deepEqual(off.features["574905726"], { defaultValue: false });
+});
+
+// 经本地代理 CONNECT 一条隧道，返回已收到 200 的 socket。
+async function tunnel(instance, target) {
+  const socket = net.connect(instance.port, "127.0.0.1");
+  socket.on("error", () => {});
+  await once(socket, "connect");
+  socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
+  const [first] = await once(socket, "data");
+  assert.match(first.toString("latin1"), /^HTTP\/1\.1 200 /);
+  return socket;
+}
+
+function readAll(socket) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.once("close", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+async function waitFor(check, message) {
+  for (let i = 0; i < 200; i++) {
+    if (check()) return;
+    await delay(10);
+  }
+  assert.fail(message);
+}
+
+test("pass-through tunnels close both sides and never leave upstream sockets behind", async () => {
+  // Claude 的非 claude 域名都经这里直通；之前 Claude 一侧 RST 断开时上游连接一直留着，越积越多。
+  const open = new Set();
+  const upstream = net.createServer((socket) => {
+    open.add(socket);
+    socket.on("error", () => {});
+    socket.once("close", () => open.delete(socket));
+    socket.on("data", (chunk) => {
+      // 收到 "bye" 时先发一大段再正常关闭：Claude 一侧必须完整收到，不能被截断。
+      if (chunk.toString().includes("bye")) socket.end(Buffer.alloc(4 * 1024 * 1024, 0x61));
+      else socket.write(chunk);
+    });
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  const target = `127.0.0.1:${upstream.address().port}`;
+  try {
+    for (let i = 0; i < 20; i++) (await tunnel(service, target)).resetAndDestroy();
+    await waitFor(() => open.size === 0, `Claude 一侧 RST 后上游仍开着 ${open.size} 条`);
+
+    for (let i = 0; i < 20; i++) (await tunnel(service, target)).end();
+    await waitFor(() => open.size === 0, `Claude 一侧正常关闭后上游仍开着 ${open.size} 条`);
+
+    const echo = await tunnel(service, target);
+    echo.write("ping");
+    assert.equal((await once(echo, "data"))[0].toString(), "ping");
+    const rest = readAll(echo);
+    echo.write("bye");
+    assert.equal((await rest).length, 4 * 1024 * 1024);
+    await waitFor(() => open.size === 0, "上游正常关闭后连接没有回收");
+  } finally {
+    for (const socket of open) socket.destroy();
+    upstream.close();
+  }
+});
+
+test("pass-through tunnels use the configured upstream proxy and abort when Claude gives up", async () => {
+  // Claude 被 --proxy-server 指到本代理后系统代理对它失效；直通也要经后端传入的出站代理。
+  const connects = [];
+  const held = new Set();
+  const upstreamProxy = http.createServer();
+  upstreamProxy.on("connect", (req, socket) => {
+    connects.push(req.url);
+    socket.on("error", () => {});
+    if (req.url.startsWith("slow.test")) {
+      // 模拟连不上的目标：一直不回 CONNECT。
+      // connect 事件交出的 socket 默认没人读，要 resume 才收得到对端关闭；
+      // HTTP server 的 socket 允许半关，对端关闭只触发 end。
+      held.add(socket);
+      socket.once("end", () => held.delete(socket));
+      socket.once("close", () => held.delete(socket));
+      socket.resume();
+      return;
+    }
+    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    socket.on("data", (chunk) => socket.write(chunk));
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  const instance = await start({ CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}` });
+  try {
+    const socket = await tunnel(instance, "example.test:443");
+    socket.write("hello");
+    assert.equal((await once(socket, "data"))[0].toString(), "hello");
+    socket.destroy();
+    assert.deepEqual(connects, ["example.test:443"]);
+
+    // Claude 等不及先关掉：本代理要同时取消发往出站代理的那条，不在后台继续等。
+    const pending = net.connect(instance.port, "127.0.0.1");
+    pending.on("error", () => {});
+    await once(pending, "connect");
+    pending.write("CONNECT slow.test:443 HTTP/1.1\r\nHost: slow.test:443\r\n\r\n");
+    await waitFor(() => held.size === 1, "没有发出 CONNECT");
+    pending.destroy();
+    await waitFor(() => held.size === 0, "Claude 放弃后发往出站代理的连接没有取消");
+  } finally {
+    await stop(instance);
+    upstreamProxy.closeAllConnections();
+    upstreamProxy.close();
+  }
 });
 
 test("clean managed runtime uses synthetic bootstrap and configured catalogs without private recordings", async () => {

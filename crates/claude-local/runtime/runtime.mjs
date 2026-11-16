@@ -113,6 +113,9 @@ export function runtimeConfig(env = process.env) {
     forceBackgroundMode: env.CLAUDE_LOCAL_FORCE_BACKGROUND_MODE === "1",
     // Cowork 总开关（GrowthBook yukon_silver，见 proxy.mjs 的 resolvedBootstrap）；没设置时按开。
     cowork: flag("COWORK"),
+    // 实验性：有模板时页面外壳也用本机 Claude 自带的版本（见 proxy.mjs 的 useOfficialShell）。
+    // 只认显式的 1：模板数据是配线上页面的，配本机页面目前缺汉化、账号和会话列表。
+    localShell: env.CLAUDE_LOCAL_LOCAL_SHELL === "1",
     // 录制 bootstrap 里自带的原生模型（Opus / Sonnet / Haiku …）不对应任何供应商，
     // 选了也会被 gatewayModel 换成默认模型；默认从选择器里拿掉，只留供应商池里的。
     hideUnroutedModels: flag("HIDE_UNROUTED_MODELS"),

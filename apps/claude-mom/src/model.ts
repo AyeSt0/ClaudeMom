@@ -44,6 +44,8 @@ export type ClaudeConfig = {
   forceBackgroundMode?: boolean;
   /** 打开 Cowork 的总开关（默认开）。 */
   cowork?: boolean;
+  /** 实验性：页面外壳用本机 Claude 自带的版本（默认关）。 */
+  localShell?: boolean;
   displayName?: string;
   email?: string;
   plan?: string;

@@ -15,6 +15,9 @@ pub struct ClaudeLocalSettings {
     /// 打开 Cowork 的总开关（GrowthBook `yukon_silver`，默认开）。录制模板里它是关的，
     /// 新版 Claude 会因此只显示 Chat / Code。平台限制（MSIX、HCS 等）仍由 Claude 自己检查。
     pub cowork: bool,
+    /// 实验性（默认关）：页面外壳用本机 Claude 自带的版本，前端资源都在本地，首次启动不用补拉上千个文件。
+    /// 目前录制模板是配线上页面的，本机页面配上它会缺汉化、账号显示和会话列表，发不了消息。
+    pub local_shell: bool,
     /// Claude 里显示的用户名；空串按「Local User」。
     pub display_name: String,
     /// Claude 里显示的邮箱；空串按「local@claude.local」。
@@ -50,6 +53,7 @@ impl Default for ClaudeLocalSettings {
             background_mode: false,
             force_background_mode: false,
             cowork: true,
+            local_shell: false,
             display_name: String::new(),
             email: String::new(),
             plan: "ultra".into(),
