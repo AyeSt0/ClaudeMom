@@ -773,18 +773,19 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// 第一个能跑本地服务的 Node（要有全局 `fetch` 和 `WebSocket`，即 Node 22+）。
+/// 逐个检查：系统里装的 Node 太旧时，退回下一个候选，而不是直接报「找不到 Node」。
 fn node_runtime() -> Option<PathBuf> {
-    let node = crate::node::locate_node()?;
-    probe(
-        hidden_command(&node).args([
-            "-e",
-            "process.exit(typeof fetch==='function'&&typeof WebSocket==='function'?0:1)",
-        ]),
-        PROBE_TIMEOUT,
-    )
-    .ok()
-    .filter(|(success, _)| *success)
-    .map(|_| node)
+    crate::node::node_candidates().into_iter().find(|node| {
+        probe(
+            hidden_command(node).args([
+                "-e",
+                "process.exit(typeof fetch==='function'&&typeof WebSocket==='function'?0:1)",
+            ]),
+            PROBE_TIMEOUT,
+        )
+        .is_ok_and(|(success, _)| success)
+    })
 }
 
 /// `--proxy-server` 完整标志：整词匹配，5351 不会误伤 53514。
