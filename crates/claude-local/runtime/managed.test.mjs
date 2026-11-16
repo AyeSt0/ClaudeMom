@@ -592,24 +592,39 @@ test("installed template turns on the Cowork GrowthBook gate unless disabled", a
   fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
     org_growthbook: {
       hashing_algorithm: "djb2",
-      features: { "574905726": { defaultValue: false }, "577907085": { defaultValue: true } },
+      features: {
+        "574905726": { defaultValue: false },
+        "577907085": { defaultValue: true },
+        // claude_ai_hub_web_delivery：录制账号在新主页实验组里，新主页藏掉了「Chat | Cowork」切换。
+        "2436273311": { defaultValue: true },
+      },
+    },
+    gated_imports_build_id: "fixture-build",
+    gated_imports: {
+      claude_ai_hub_web_delivery: { hash: "hub", css: [], preload: [] },
+      cardinal: { hash: "cardinal", css: [], preload: [] },
     },
   }));
   const env = { CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache") };
   const features = async (extra) => {
     const instance = await start({ ...env, ...extra }, runtimeDir);
     try {
-      return (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json.org_growthbook;
+      return (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
     } finally {
       await stop(instance);
     }
   };
   const on = await features({});
-  assert.deepEqual(on.features["574905726"], { defaultValue: true });
-  assert.deepEqual(on.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
-  assert.equal(on.hashing_algorithm, "djb2");
+  assert.deepEqual(on.org_growthbook.features["574905726"], { defaultValue: true });
+  assert.deepEqual(on.org_growthbook.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
+  assert.equal(on.org_growthbook.hashing_algorithm, "djb2");
+  // 新主页：开关和按 gated_imports 下发的代码都要去掉，Cowork 切换才会出现。
+  assert.deepEqual(on.org_growthbook.features["2436273311"], { defaultValue: false });
+  assert.deepEqual(Object.keys(on.gated_imports), ["cardinal"]);
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
-  assert.deepEqual(off.features["574905726"], { defaultValue: false });
+  assert.deepEqual(off.org_growthbook.features["574905726"], { defaultValue: false });
+  assert.deepEqual(off.org_growthbook.features["2436273311"], { defaultValue: true }, "关掉 Cowork 时不动新主页");
+  assert.deepEqual(Object.keys(off.gated_imports).sort(), ["cardinal", "claude_ai_hub_web_delivery"]);
 });
 
 // 经本地代理 CONNECT 一条隧道，返回已收到 200 的 socket。

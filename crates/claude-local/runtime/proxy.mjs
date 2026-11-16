@@ -749,12 +749,25 @@ function mockEdgeApi(req, res, url) {
 // 否则模板的 false 会盖掉。id 的算法跟模板走：只改写模板自带的 GrowthBook 表，
 // 合成兜底（localBootstrap 的空表）的 hashing_algorithm 不同，不往里塞。
 const COWORK_FEATURE_ID = "574905726";
+// claude_ai_hub_web_delivery：录制模板的账号在 chatwork_free_experiment 实验组里，这个开关是开的，
+// Claude 换成把 Chat 和 Cowork 合在一起的新主页，输入框上的「Chat | Cowork」切换被藏起来，
+// 本地模式下就找不到 Cowork 入口。打开 Cowork 时关掉它，回到有切换的主页。
+const HUB_DELIVERY_FEATURE_ID = "2436273311";
 function forceCowork(result, template) {
   if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
   result.org_growthbook = {
     ...result.org_growthbook,
-    features: { ...result.org_growthbook.features, [COWORK_FEATURE_ID]: { defaultValue: true } },
+    features: {
+      ...result.org_growthbook.features,
+      [COWORK_FEATURE_ID]: { defaultValue: true },
+      [HUB_DELIVERY_FEATURE_ID]: { defaultValue: false },
+    },
   };
+  // 新主页的代码是按 gated_imports 下发的，光关 GrowthBook 开关不够：前端看到这一项仍会装上它。
+  if (result.gated_imports?.claude_ai_hub_web_delivery) {
+    const { claude_ai_hub_web_delivery: _hub, ...rest } = result.gated_imports;
+    result.gated_imports = rest;
+  }
 }
 
 let resolvedBootstrapCache;
