@@ -18,6 +18,9 @@ pub struct ClaudeLocalSettings {
     /// 实验性（默认关）：页面外壳用本机 Claude 自带的版本，前端资源都在本地，首次启动不用补拉上千个文件。
     /// 目前录制模板是配线上页面的，本机页面配上它会缺汉化、账号显示和会话列表，发不了消息。
     pub local_shell: bool,
+    /// 用 Claude 的新版主页（GrowthBook `claude_ai_hub_web_delivery`，默认关）：对话和 Cowork 合在一个输入框里，
+    /// 没有「对话 | Cowork」切换。录制模板的账号在这个实验组里，关着时改回有切换的经典主页。
+    pub hub_home: bool,
     /// Claude 里显示的用户名；空串按「Local User」。
     pub display_name: String,
     /// Claude 里显示的邮箱；空串按「local@claude.local」。
@@ -54,6 +57,7 @@ impl Default for ClaudeLocalSettings {
             force_background_mode: false,
             cowork: true,
             local_shell: false,
+            hub_home: false,
             display_name: String::new(),
             email: String::new(),
             plan: "ultra".into(),

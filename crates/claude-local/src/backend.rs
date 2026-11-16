@@ -1724,6 +1724,7 @@ fn start_backend(
         .env("CLAUDE_LOCAL_FORCE_BACKGROUND_MODE", flag(config.force_background_mode))
         .env("CLAUDE_LOCAL_COWORK", flag(config.cowork))
         .env("CLAUDE_LOCAL_LOCAL_SHELL", flag(config.local_shell))
+        .env("CLAUDE_LOCAL_HUB_HOME", flag(config.hub_home))
         .env("CLAUDE_LOCAL_HIDE_UNROUTED_MODELS", flag(config.hide_unrouted_models))
         .env("CLAUDE_LOCAL_DISPLAY_NAME", config.effective_display_name())
         .env("CLAUDE_LOCAL_EMAIL", config.effective_email())
@@ -3377,6 +3378,9 @@ RGvMS5OzZFvnFlekIHE6c+6QK9QtWD7P+PkIpRa1D01cb9SwsRHqGfs7o2UbaZxs\n\
         assert!(legacy.cowork);
         assert!(!legacy.local_shell);
         assert_eq!(value["localShell"], false);
+        // 新版主页默认关（经典主页有「对话 | Cowork」切换）。
+        assert!(!legacy.hub_home);
+        assert_eq!(value["hubHome"], false);
         // 强制后台模式会连带打开后台模式和电脑控制。
         let forced = validate_config(ClaudeLocalSettings {
             force_background_mode: true,

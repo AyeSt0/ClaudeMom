@@ -26,6 +26,7 @@ Claude 安装包。代理、证书、缓存和会话数据由 Codex++ 放在独�
 | `CLAUDE_LOCAL_LOCALIZATION` / `_VOICE_INPUT` / `_COMPUTER_USE` / `_BACKGROUND_MODE` / `_FORCE_BACKGROUND_MODE` | 各能力的独立开关，`0` 关闭、`1` 开启；最后一个无视后台模式的 macOS 版本上限 |
 | `CLAUDE_LOCAL_LOCAL_SHELL` | 实验性，只认 `1`：有模板时页面外壳也用本机 Claude 自带的版本。模板数据配的是线上页面，目前会缺汉化、账号显示和会话列表 |
 | `CLAUDE_LOCAL_COWORK` | Cowork 总开关（GrowthBook `yukon_silver`），默认开，`0` 时按录制模板里 Claude 自己的值 |
+| `CLAUDE_LOCAL_HUB_HOME` | 只认 `1`：用 Claude 的新版主页（GrowthBook `claude_ai_hub_web_delivery`，对话和 Cowork 合在一个输入框里）。默认用有「对话 \| Cowork」切换的经典主页：关掉这个开关，并从 `gated_imports` 里去掉它的代码 |
 
 受管启动支持 `--port 0`，监听后写入
 `{instanceId,pid,port,mode,lastClientAt}` 回执，不包含网关凭据。

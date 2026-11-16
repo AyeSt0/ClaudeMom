@@ -46,6 +46,8 @@ export type ClaudeConfig = {
   cowork?: boolean;
   /** 实验性：页面外壳用本机 Claude 自带的版本（默认关）。 */
   localShell?: boolean;
+  /** 用 Claude 的新版主页：对话和 Cowork 合在一起，没有「对话 | Cowork」切换（默认关）。 */
+  hubHome?: boolean;
   displayName?: string;
   email?: string;
   plan?: string;

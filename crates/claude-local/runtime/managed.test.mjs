@@ -584,7 +584,7 @@ test("unpacked ion-dist directory is served when the Claude build ships no ASAR"
   }
 });
 
-test("installed template turns on the Cowork GrowthBook gate unless disabled", async () => {
+test("installed template turns on Cowork and uses the classic home unless the new home is chosen", async () => {
   // 录制模板里 yukon_silver（574905726）是 false，新版 Claude 只显示 Chat / Code（issue #4）。
   const runtimeDir = path.join(root, "cowork-runtime");
   fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
@@ -618,13 +618,17 @@ test("installed template turns on the Cowork GrowthBook gate unless disabled", a
   assert.deepEqual(on.org_growthbook.features["574905726"], { defaultValue: true });
   assert.deepEqual(on.org_growthbook.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
   assert.equal(on.org_growthbook.hashing_algorithm, "djb2");
-  // 新主页：开关和按 gated_imports 下发的代码都要去掉，Cowork 切换才会出现。
+  // 默认经典主页：新版主页的开关和按 gated_imports 下发的代码都要去掉，「对话 | Cowork」切换才会出现。
   assert.deepEqual(on.org_growthbook.features["2436273311"], { defaultValue: false });
   assert.deepEqual(Object.keys(on.gated_imports), ["cardinal"]);
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
   assert.deepEqual(off.org_growthbook.features["574905726"], { defaultValue: false });
-  assert.deepEqual(off.org_growthbook.features["2436273311"], { defaultValue: true }, "关掉 Cowork 时不动新主页");
-  assert.deepEqual(Object.keys(off.gated_imports).sort(), ["cardinal", "claude_ai_hub_web_delivery"]);
+  assert.deepEqual(off.org_growthbook.features["2436273311"], { defaultValue: false }, "主页样式和 Cowork 开关互不相干");
+  // 设置里选了新版主页：两处都按模板原样。
+  const hub = await features({ CLAUDE_LOCAL_HUB_HOME: "1" });
+  assert.deepEqual(hub.org_growthbook.features["574905726"], { defaultValue: true });
+  assert.deepEqual(hub.org_growthbook.features["2436273311"], { defaultValue: true });
+  assert.deepEqual(Object.keys(hub.gated_imports).sort(), ["cardinal", "claude_ai_hub_web_delivery"]);
 });
 
 // 经本地代理 CONNECT 一条隧道，返回已收到 200 的 socket。
