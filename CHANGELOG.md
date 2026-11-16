@@ -1,5 +1,14 @@
 # 更新日志
 
+## 0.1.6 - 2026-11-16
+
+- Chat、Cowork 的会话标题改由上游模型生成，不再全都叫「New task」或没有标题；会话可以改名、删除。
+- 修复 Chat 部分请求被压缩后提问内容丢失的问题。
+- Windows：听写一直连不上（语音服务 503）的问题修好了。
+- Cowork 提交任务时报「Invalid BFF response format」的问题修好了。
+- Artifacts 报「policy check couldn't get through」的问题修好了。
+- 优先用系统里装的 Node.js（22 及以上）运行本地服务，不再借用 ChatGPT / Codex 自带的；系统里的版本太旧时才退回去用它们。
+
 ## 0.1.5 - 2026-11-16
 
 - Code / Cowork 首次使用时「无法下载 Claude Code（IDLE_TIMEOUT）」的问题修好了：大文件改为边下边转，不再整个读进内存（下载时内存也不会再涨到几个 GB）。
