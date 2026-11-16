@@ -898,11 +898,25 @@ fn is_desktop_claude_image(exe_file: &str, path: Option<&Path>) -> bool {
         .is_some_and(|dir| dir.join("resources").join("app.asar").is_file())
 }
 
+/// 进程是不是当前用户自己的：同一台电脑上别的用户（Windows 的另一个会话、macOS 的快速切换用户）
+/// 开着的 Claude 不算，否则这边会一直显示「Claude 正在运行」、启动按钮变灰（issue #2）。
+/// 任一边查不到时按「是」：宁可多拦一次，也不在 Claude 其实开着时再启动一个。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn in_own_session(own: Option<u32>, process: Option<u32>) -> bool {
+    match (own, process) {
+        (Some(own), Some(process)) => own == process,
+        _ => true,
+    }
+}
+
 fn claude_processes() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
+        // 只看当前用户的进程（pgrep 默认匹配所有用户）。
+        // SAFETY: getuid 无参数、不会失败。
+        let uid = unsafe { libc::getuid() }.to_string();
         let (success, bytes) = probe(
-            Command::new("/usr/bin/pgrep").args(["-fl", "/Contents/MacOS/Claude( |$)"]),
+            Command::new("/usr/bin/pgrep").args(["-U", &uid, "-fl", "/Contents/MacOS/Claude( |$)"]),
             PROBE_TIMEOUT,
         )?;
         return Ok(if success {
@@ -915,8 +929,12 @@ fn claude_processes() -> Result<String> {
     {
         // 与 pgrep -fl 同一形状：`{pid} {command_line}`，pids_on_proxy/use_proxy 原样可用。
         let mut listing = String::new();
+        let own_session = crate::winproc::current_session_id();
         for info in crate::winproc::enumerate_processes() {
             if !is_desktop_claude_image(&info.exe_file, info.executable_path.as_deref()) {
+                continue;
+            }
+            if !in_own_session(own_session, info.session_id) {
                 continue;
             }
             let command_line = crate::winproc::process_command_line(info.process_id)
@@ -3280,6 +3298,17 @@ RGvMS5OzZFvnFlekIHE6c+6QK9QtWD7P+PkIpRa1D01cb9SwsRHqGfs7o2UbaZxs\n\
         assert!(is_desktop_claude_image("Claude.exe", None));
         // 名字不是 Claude.exe 一律不算
         assert!(!is_desktop_claude_image("node.exe", None));
+    }
+
+    #[test]
+    fn claude_in_another_users_session_does_not_count() {
+        // issue #2：主账户里开着 Claude，另一个 Windows 账户里的 ClaudeMom 启动按钮一直灰。
+        assert!(in_own_session(Some(2), Some(2)));
+        assert!(!in_own_session(Some(2), Some(1)), "别的会话里的 Claude 不算");
+        // 查不到会话时照旧算作在运行，不冒险再启动一个。
+        assert!(in_own_session(Some(2), None));
+        assert!(in_own_session(None, Some(1)));
+        assert!(in_own_session(None, None));
     }
 
     #[test]
