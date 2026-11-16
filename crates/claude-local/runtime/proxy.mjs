@@ -26,7 +26,7 @@ import { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createStateStore, dropUnroutedModels, gatewayBody, gatewayModel, gatewayTarget, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -758,7 +758,44 @@ function resolvedBootstrap() {
 
 // REST 侧的会话条目：拿录制文件里的第一条当模板，叠动态字段
 let REST_CONV_TEMPLATE = null;
-function convToRest(c) {
+/**
+ * 模板里录下的 Anthropic 示例技能，内容只能从 Anthropic 下载，本地模式一个都装不上。
+ * 原样标成「已启用」的话，Claude 每次同步都要去下载、全部失败（0 downloaded / 5 failed）。
+ */
+function offlineSkills(data) {
+  if (!Array.isArray(data?.skills)) return data;
+  return { ...data, skills: data.skills.map((skill) => ({ ...skill, enabled: false })) };
+}
+
+function restTime(value, fallback) {
+  const date = value ? new Date(value) : null;
+  return date && !Number.isNaN(date.getTime()) ? date.toISOString() : fallback;
+}
+
+/**
+ * 会话详情里的消息。REST 的 /completion 记在 chat_messages；claudeai-rpc 记在 turns，
+ * 两边都要能读出来，否则从另一条路径建的会话打开就是空的。
+ */
+function restMessages(c) {
+  if (c.chat_messages?.length) return c.chat_messages;
+  const messages = [];
+  for (const turn of c.turns || []) {
+    const created = restTime(turn.created, c.created_at);
+    const entry = (uuid, sender, index, parent, text, extra = {}) => ({
+      uuid, sender, index, parent_message_uuid: parent ?? null, text,
+      content: [{ type: "text", text, citations: [] }],
+      created_at: created, updated_at: created, ...extra,
+    });
+    messages.push(entry(turn.humanId, "human", turn.humanIndex, turn.humanParent, turn.prompt || ""));
+    if (turn.complete || turn.text) {
+      messages.push(entry(turn.asstId, "assistant", turn.asstIndex, turn.humanId, turn.text || "",
+        turn.complete ? { stop_reason: turn.stopReason === "error" ? "error" : "end_turn" } : {}));
+    }
+  }
+  return messages;
+}
+
+function convToRest(c, { messages = false } = {}) {
   if (!REST_CONV_TEMPLATE) {
     try {
       if (dataManaged) throw new Error("Managed mode uses synthetic data");
@@ -776,9 +813,10 @@ function convToRest(c) {
     model: c.model || runtime.model,
     created_at: c.created_at,
     updated_at: c.updated_at,
-    current_leaf_message_uuid: c.leafMessageId || null,
+    current_leaf_message_uuid: c.leafMessageId || c.current_leaf_message_uuid || null,
     live_status: live ? "running" : null,
     last_settled_at: live ? null : c.updated_at,
+    ...(messages ? { chat_messages: restMessages(c) } : {}),
   };
 }
 
@@ -801,7 +839,7 @@ function mockApi(req, res, url) {
 
   const convGet = p.match(/\/chat_conversations\/([0-9a-f-]{36})$/);
   if (convGet && method === "GET") {
-    return json(res, convToRest(ensureConv(convGet[1])));
+    return json(res, convToRest(ensureConv(convGet[1]), { messages: true }));
   }
 
   // 会话列表：静态模板 + 运行期动态会话（RPC 建的）合并，按更新时间倒序
@@ -835,6 +873,7 @@ function mockApi(req, res, url) {
       if (!dataManaged && fs.existsSync(f)) {
         try {
           const data = JSON.parse(fs.readFileSync(f, "utf8"));
+          if (slug === "skills") return json(res, offlineSkills(data));
           return slug === "account_profile"
             ? jsonWithActiveOrg(res, normalizeAccountProfile(data))
             : json(res, data);
@@ -886,6 +925,12 @@ function mockApi(req, res, url) {
       "1291166712": {
         value: { enabled: runtime.computerUse, appScopedEnabled: runtime.computerUse && runtime.backgroundMode },
         on: runtime.computerUse, off: !runtime.computerUse, source: "force",
+        experiment: null, experimentResult: null,
+      },
+      // Windows 上计算机使用的另一道门：Claude 里是 `process.platform==="win32"&&!X("40173473")` 就不给开，
+      // 设置页显示「您的账户尚未启用计算机使用功能」。macOS 不读它。
+      "40173473": {
+        value: runtime.computerUse, on: runtime.computerUse, off: !runtime.computerUse, source: "force",
         experiment: null, experimentResult: null,
       },
     };
@@ -1116,9 +1161,9 @@ function mockApi(req, res, url) {
     return json(res, { settings: {}, entries: [], items: [] });
   }
   if (/\/skills\/download-dot-skill-file/.test(p)) {
-    // 区域封锁拿不到真 zip；回空 body 让下载器安静失败而不是 parse 报错
-    res.writeHead(204, { "content-length": 0 });
-    return res.end();
+    // 技能内容在 Anthropic 服务器上，本地拿不到。列表里已经都标成未启用（offlineSkills），
+    // 用户手动打开时回一个明确的 404，而不是 204 空体（Claude 会报「Response body is null」）。
+    return json(res, { type: "error", error: { type: "not_found_error", message: "本地模式没有这个技能的内容" } }, 404);
   }
   // 登录后组织选择页的数据源；item 的 uuid 要放在客户端读的位置（否则 join 打成 /undefined/join）
   if (p === "/api/organizations/discoverable") {
@@ -1155,7 +1200,7 @@ function mockApi(req, res, url) {
   }
   const convMatch = p.match(/\/chat_conversations\/([^/]+)$/);
   if (convMatch) {
-    if (CONV_STATE.has(convMatch[1])) return json(res, convToRest(ensureConv(convMatch[1])));
+    if (CONV_STATE.has(convMatch[1])) return json(res, convToRest(ensureConv(convMatch[1]), { messages: true }));
     return json(res, { error: "not found" }, 404);
   }
   if (/\/completion$/.test(p)) {
@@ -1187,9 +1232,22 @@ function mockApi(req, res, url) {
         pushMessage(conv, { uuid: human, sender: "human", text: prompt });
       }
       let acc = "";
+      let settled = false;
+      // 上游出错时把原因写进回复里：只发 error 事件的话，Claude 只会显示「连接已中断」。
+      const fail = (message) => {
+        if (settled) return;
+        settled = true;
+        log(`completion failed${runtime.managed ? "" : `: ${message}`}`);
+        const text = `${acc ? "\n\n" : ""}[网关错误：${message}]`;
+        sendEv("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+        sendEv("content_block_stop", { type: "content_block_stop", index: 0 });
+        sendEv("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } });
+        sendEv("message_stop", { type: "message_stop" });
+        res.end();
+      };
       const payload = JSON.stringify({
         model,
-        max_tokens: 2048,
+        max_tokens: 4096,
         stream: true,
         messages: conv ? conv.chat_messages.map((message) => ({
           role: message.sender === "human" ? "user" : "assistant", content: message.text,
@@ -1211,38 +1269,42 @@ function mockApi(req, res, url) {
           },
         },
         (gres) => {
-          let buf = "";
-          gres.on("data", (chunk) => {
-            buf += chunk.toString("utf8");
-            let i;
-            while ((i = buf.indexOf("\n\n")) >= 0) {
-              const ev = buf.slice(0, i);
-              buf = buf.slice(i + 2);
-              const dataLine = ev.split("\n").find((l) => l.startsWith("data:"));
-              if (!dataLine) continue;
-              let d;
-              try { d = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
-              if (d.type === "content_block_delta" && d.delta?.type === "text_delta") {
-                acc += d.delta.text;
-                sendEv("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: d.delta.text } });
-              } else if (d.type === "message_stop") {
-                if (conv && !conv.chat_messages.some((m) => m.uuid === asst)) {
-                  pushMessage(conv, { uuid: asst, sender: "assistant", parent: human, text: acc, stop_reason: "end_turn" });
-                  stateStore.flush();
-                }
-                sendEv("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } });
-                sendEv("message_stop", { type: "message_stop" });
-                res.end();
+          if (gres.statusCode < 200 || gres.statusCode >= 300) {
+            const chunks = [];
+            let size = 0;
+            gres.on("data", (c) => { if (size < 65536) { chunks.push(c); size += c.length; } });
+            gres.on("end", () => fail(gatewayHttpError(gres.statusCode, Buffer.concat(chunks))));
+            gres.on("error", (e) => fail(e.message));
+            return;
+          }
+          const parser = createGatewayStreamParser({
+            text: (text) => {
+              if (settled) return;
+              acc += text;
+              sendEv("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+            },
+            stop: () => {
+              if (settled) return;
+              settled = true;
+              if (conv && !conv.chat_messages.some((m) => m.uuid === asst)) {
+                pushMessage(conv, { uuid: asst, sender: "assistant", parent: human, text: acc, stop_reason: "end_turn" });
+                stateStore.flush();
               }
-            }
+              sendEv("content_block_stop", { type: "content_block_stop", index: 0 });
+              sendEv("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } });
+              sendEv("message_stop", { type: "message_stop" });
+              res.end();
+            },
+            error: fail,
           });
-          gres.on("end", () => { try { res.end(); } catch {} });
+          gres.on("data", (chunk) => parser.write(chunk));
+          gres.on("end", () => parser.end());
+          gres.on("error", (e) => fail(e.message));
         },
       );
-      greq.on("error", (e) => {
-        sendEv("error", { type: "error", error: { message: e.message } });
-        try { res.end(); } catch {}
-      });
+      greq.setTimeout(300_000, () => greq.destroy(new Error("上游超时：5 分钟没有响应")));
+      greq.on("error", (e) => fail(e.message));
+      res.on("close", () => { if (!settled) { settled = true; greq.destroy(); } });
       greq.end(payload);
     });
     return;
@@ -1283,14 +1345,26 @@ function isHashedStaticAsset(req, url) {
     /\/[^/]+-[A-Za-z0-9_-]{8,}\.(?:m?js|css|wasm|woff2?|ttf|otf|png|jpe?g|webp|gif|svg|ico)$/.test(url.pathname);
 }
 
-function bufferedResponseHeaders(headers, length) {
+function withoutHopByHop(headers) {
   const result = { ...headers };
   const connectionHeaders = String(result.connection || "").split(",").map((name) => name.trim().toLowerCase());
   for (const name of ["connection", "transfer-encoding", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade", ...connectionHeaders]) {
     delete result[name];
   }
+  return result;
+}
+
+function bufferedResponseHeaders(headers, length) {
+  const result = withoutHopByHop(headers);
   // Buffer 未解压，保留 content-encoding 并以实际传输字节数更新长度。
   result["content-length"] = length;
+  return result;
+}
+
+/** 原样转发的响应头：上游给了长度就沿用（下载器靠它显示进度），分块传输由 Node 重新分块。 */
+function streamedResponseHeaders(headers) {
+  const result = withoutHopByHop(headers);
+  if (headers["transfer-encoding"]) delete result["content-length"];
   return result;
 }
 
@@ -1581,6 +1655,16 @@ function proxyUpstream(req, res, url) {
       timeout: 20000,
     },
     (up) => {
+      if (!canCache) {
+        // 边收边转：Claude Code 安装包（上百 MB）、Cowork 虚拟机镜像（GB 级）以前要整个读进内存才开始回，
+        // 下载器在这段时间收不到一个字节，空闲超时（IDLE_TIMEOUT）就放弃了。
+        res.writeHead(up.statusCode, streamedResponseHeaders(up.headers));
+        up.pipe(res);
+        res.on("close", () => { if (!up.complete) upstreamReq.destroy(); });
+        up.on("close", () => { if (!up.complete) res.destroy(); });
+        return;
+      }
+      // 要缓存的只有带哈希的静态资源和页面，都不大：收齐再回，和之后从缓存回放的字节、长度一致。
       const chunks = [];
       up.on("data", (c) => chunks.push(c));
       up.on("end", () => {
@@ -1588,7 +1672,7 @@ function proxyUpstream(req, res, url) {
         const ok = up.statusCode >= 200 && up.statusCode < 400;
         // 文档路由不缓存桩体/落地页 HTML（登出页会让 SPA 卡骨架屏）
         const docStub = isDocNav(req, url) && body.length < 4096;
-        if (ok && !docStub && canCache && (!staticAsset || (
+        if (ok && !docStub && (!staticAsset || (
           up.statusCode === 200 && !up.headers["set-cookie"] &&
           !/\b(?:private|no-store)\b/i.test(String(up.headers["cache-control"] || ""))
         ))) {
@@ -1606,6 +1690,11 @@ function proxyUpstream(req, res, url) {
   );
   upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("upstream timeout")));
   upstreamReq.on("error", (err) => {
+    if (res.headersSent) {
+      // 已经开始转发了，没法再换成兜底响应；断开让客户端知道没收全。
+      log(`UPSTREAM FAIL ${url.pathname} (mid-stream): ${err.message}`);
+      return res.destroy();
+    }
     if (serveCachedStaticAsset(req, res, url)) return;
     // 动态接口不能回放其它会话的缓存；文档仍沿用本地外壳兜底。
     if (canCache && document && fs.existsSync(cp) && fs.existsSync(metaPath)) {

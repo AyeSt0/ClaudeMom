@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
-import { createStateStore, dropUnroutedModels, gatewayModel, gatewayTarget, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, gatewayModel, gatewayTarget, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -200,6 +200,29 @@ before(async () => {
     for await (const chunk of req) chunks.push(chunk);
     const raw = Buffer.concat(chunks).toString("utf8");
     received.push({ path: req.url, headers: req.headers, body: raw ? JSON.parse(raw) : null });
+    // 用最后一条用户消息挑选上游的「坏」行为，模拟各家网关不规范的回法。
+    const last = raw ? JSON.parse(raw).messages?.at(-1)?.content : null;
+    if (last === "case:http-401") {
+      res.writeHead(401, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "invalid x-api-key" } }));
+    }
+    if (last === "case:stream-error") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      return res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n');
+    }
+    if (last === "case:crlf") {
+      // CRLF 分隔、`\r` 和 `\n` 落在两个包里、中文字符被拆开、最后不发 message_stop。
+      const text = Buffer.from('event: content_block_delta\r\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"换行"}}\r\n\r\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":" ok"}}\r\n\r\n');
+      const split = text.indexOf("换") + 1;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(text.subarray(0, split));
+      res.write(text.subarray(split, text.indexOf("\r\n\r\n") + 1));
+      return res.end(text.subarray(text.indexOf("\r\n\r\n") + 1));
+    }
+    if (last === "case:json") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ type: "message", content: [{ type: "text", text: "whole json reply" }] }));
+    }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.end('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"gateway reply"}}\n\ndata: {"type":"message_stop"}\n\n');
   });
@@ -906,6 +929,110 @@ test("RPC sends preserve model choice, switching, complete history and restart s
   assert.equal(prefs.json.preferences.feature_preference.complete.enable_email, false);
   assert.equal(service.output().includes("first test"), false);
   assert.equal(service.output().includes("test-local-gateway-token"), false);
+});
+
+function parseGateway(chunks) {
+  const result = { text: "", stop: 0, error: null };
+  const parser = createGatewayStreamParser({
+    text: (text) => { result.text += text; },
+    stop: () => { result.stop++; },
+    error: (message) => { result.error = message; },
+  });
+  for (const chunk of chunks) parser.write(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  parser.end();
+  return result;
+}
+
+test("gateway stream parser tolerates CRLF, split characters, [DONE] and missing message_stop", () => {
+  const body = Buffer.from('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"你好"}}\r\n\r\ndata: [DONE]\r\n\r\n');
+  const cut = body.indexOf("你") + 1;
+  const crlf = body.indexOf("\r\n\r\n") + 1;
+  assert.deepEqual(parseGateway([body.subarray(0, cut), body.subarray(cut, crlf), body.subarray(crlf)]), { text: "你好", stop: 1, error: null });
+  assert.deepEqual(parseGateway(['data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"a"}}\n\n', 'data: {"type":"message_stop"}\n\n']), { text: "a", stop: 1, error: null });
+  // 一个事件多行 data
+  assert.deepEqual(parseGateway(['data: {"type":"content_block_delta",\ndata: "delta":{"type":"text_delta","text":"b"}}\n\n']), { text: "b", stop: 1, error: null });
+});
+
+test("gateway stream parser reports upstream errors instead of ending silently", () => {
+  assert.deepEqual(parseGateway(['event: error\ndata: {"type":"error","error":{"message":"Overloaded"}}\n\n']), { text: "", stop: 0, error: "上游返回错误：Overloaded" });
+  assert.deepEqual(parseGateway([]), { text: "", stop: 0, error: "上游没有返回任何内容" });
+  assert.deepEqual(parseGateway(['event: ping\ndata: {"type":"ping"}\n\n']), { text: "", stop: 0, error: "上游没有返回任何内容" });
+  // 无视 stream:true、直接回整段 JSON 的网关
+  assert.deepEqual(parseGateway(['{"type":"message","content":[{"type":"text","text":"whole"}]}']), { text: "whole", stop: 1, error: null });
+  assert.deepEqual(parseGateway(['{"error":{"message":"model not found"}}']), { text: "", stop: 0, error: "上游返回错误：model not found" });
+  assert.equal(parseGateway(["<html>bad gateway</html>"]).error, "上游返回的不是流式回复：<html>bad gateway</html>");
+  assert.equal(gatewayHttpError(401, Buffer.from('{"type":"error","error":{"message":"invalid x-api-key"}}')), "上游返回 HTTP 401：invalid x-api-key");
+  assert.equal(gatewayHttpError(502, Buffer.from("  <h1>Bad\n Gateway</h1> ")), "上游返回 HTTP 502：<h1>Bad Gateway</h1>");
+  assert.equal(gatewayHttpError(500, Buffer.alloc(0)), "上游返回 HTTP 500");
+});
+
+function sseEvents(bytes) {
+  return bytes.toString("utf8").split("\n\n").filter(Boolean).map((block) => {
+    const event = block.match(/^event: (.+)$/m)?.[1];
+    const data = block.match(/^data: (.+)$/m)?.[1];
+    return { event, data: data ? JSON.parse(data) : null };
+  });
+}
+
+test("REST completions show the upstream's error in the reply and end the stream properly", async () => {
+  const completion = async (conv, prompt) => {
+    const result = await request(service, `/api/organizations/local/chat_conversations/${conv}/completion`, {
+      host: "claude.ai",
+      body: { prompt, turn_message_uuids: { human_message_uuid: crypto.randomUUID(), assistant_message_uuid: crypto.randomUUID() } },
+    });
+    assert.equal(result.status, 200);
+    const events = sseEvents(result.bytes);
+    assert.equal(events.at(-1).event, "message_stop", "流必须正常收尾，否则 Claude 显示「连接已中断」");
+    return events.filter((e) => e.event === "content_block_delta").map((e) => e.data.delta.text).join("");
+  };
+  assert.equal(await completion(crypto.randomUUID(), "case:http-401"), "[网关错误：上游返回 HTTP 401：invalid x-api-key]");
+  assert.equal(await completion(crypto.randomUUID(), "case:stream-error"), "[网关错误：上游返回错误：Overloaded]");
+  assert.equal(await completion(crypto.randomUUID(), "case:json"), "whole json reply");
+  const conv = crypto.randomUUID();
+  assert.equal(await completion(conv, "case:crlf"), "换行 ok");
+  assert.equal(received.at(-1).body.max_tokens, 4096);
+  // 会话详情带上消息和叶子节点（#16）
+  const detail = await request(service, `/api/organizations/local/chat_conversations/${conv}`, { host: "claude.ai" });
+  assert.deepEqual(detail.json.chat_messages.map((m) => [m.sender, m.text]), [["human", "case:crlf"], ["assistant", "换行 ok"]]);
+  assert.equal(detail.json.current_leaf_message_uuid, detail.json.chat_messages[1].uuid);
+  assert.equal(service.output().includes("invalid x-api-key"), false, "受管模式不把上游错误细节写进日志");
+});
+
+test("RPC replies carry the upstream's HTTP error and RPC conversations open with their messages", async () => {
+  const conv = "c0c0c0c0-d1d1-42e2-83f3-a4a4a4a4a4a4";
+  const rpc = (name, body) => request(service, `/claudeai-rpc/anthropic.bard.api.v1alpha.ConversationService/${name}`, {
+    host: "claude.ai", body, type: "application/proto",
+  });
+  await rpc("SendAndSettle", send(conv, "case:http-401"));
+  const detail = await request(service, `/api/organizations/local/chat_conversations/${conv}`, { host: "claude.ai" });
+  const messages = detail.json.chat_messages;
+  assert.deepEqual(messages.map((m) => m.sender), ["human", "assistant"]);
+  assert.equal(messages[0].text, "case:http-401");
+  assert.match(messages[1].text, /\[网关错误：上游返回 HTTP 401：invalid x-api-key\]$/);
+  assert.equal(messages[1].parent_message_uuid, messages[0].uuid);
+  assert.equal(detail.json.current_leaf_message_uuid, messages[1].uuid);
+  const list = await request(service, "/api/organizations/local/chat_conversations", { host: "claude.ai" });
+  assert.equal(list.json.find((c) => c.uuid === conv).chat_messages, undefined, "会话列表不带消息");
+});
+
+test("installed template lists its example skills as disabled so Claude does not download them", async () => {
+  // 技能内容只在 Anthropic 服务器上，本地装不上；标成已启用会让每次同步都失败（#16）。
+  const runtimeDir = path.join(root, "skills-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
+  fs.writeFileSync(path.join(runtimeDir, "mock", "api", "skills.json"), JSON.stringify({
+    skills: [{ id: "morning", name: "morning", enabled: true }, { id: "learn", name: "learn", enabled: false }],
+  }));
+  const instance = await start({ CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache") }, runtimeDir);
+  try {
+    const list = await request(instance, "/api/organizations/local/skills/list-skills", { host: "claude.ai" });
+    assert.deepEqual(list.json.skills, [{ id: "morning", name: "morning", enabled: false }, { id: "learn", name: "learn", enabled: false }]);
+    const download = await request(instance, "/api/organizations/local/skills/download-dot-skill-file?skill_id=morning&entrypoint=local-agent", { host: "claude.ai" });
+    assert.equal(download.status, 404);
+    assert.equal(download.json.error.type, "not_found_error");
+  } finally {
+    await stop(instance);
+  }
 });
 
 test("managed SIGTERM and stdin closure flush state and release the listener", async () => {

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const MAX_TEXT = 1024 * 1024;
@@ -152,6 +153,119 @@ export function gatewayModel(config, requested) {
   if (/^(?:claude-)?haiku(?:-|$)/i.test(requested || "")) return config.smallModel;
   if (config.managed || !requested || /^(?:claude-|sonnet|opus|haiku)/i.test(requested)) return config.model;
   return requested;
+}
+
+const GATEWAY_RAW_LIMIT = 1 << 20;
+
+function gatewayErrorText(value) {
+  if (!isRecord(value)) return "";
+  const error = value.error;
+  if (typeof error === "string") return error;
+  if (isRecord(error) && typeof error.message === "string") return error.message;
+  return typeof value.message === "string" ? value.message : "";
+}
+
+function clip(text, limit = 300) {
+  const value = String(text).replace(/\s+/g, " ").trim();
+  return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+/** 上游 /v1/messages 回了非 2xx 时给用户看的原因：状态码 + 上游自己的错误信息。 */
+export function gatewayHttpError(status, body) {
+  const raw = Buffer.isBuffer(body) ? body.toString("utf8") : String(body || "");
+  let detail = "";
+  try { detail = gatewayErrorText(JSON.parse(raw)); } catch {}
+  detail = clip(detail || raw);
+  return detail ? `上游返回 HTTP ${status}：${detail}` : `上游返回 HTTP ${status}`;
+}
+
+/**
+ * 解析上游 /v1/messages 的流式响应（只取文本）。
+ *
+ * 各家网关并不都按规范来：事件之间用 CRLF 分隔、一个事件多行 data、流里带 `type:"error"`、
+ * 不发 message_stop 就结束，甚至无视 stream:true 直接回一整段 JSON。以前遇到这些
+ * 一律静默结束，Claude 只能显示「连接已中断」；这里统一归结为 text / stop / error 三种回调。
+ */
+export function createGatewayStreamParser({ text, stop, error }) {
+  const decoder = new StringDecoder("utf8");
+  let buf = "";
+  let pendingCr = false;
+  let raw = "";
+  let sawEvent = false;
+  let sawText = false;
+  let finished = false;
+
+  const finish = (fn, ...args) => {
+    if (finished) return;
+    finished = true;
+    fn(...args);
+  };
+  const dispatch = (block) => {
+    const data = block
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(line.startsWith("data: ") ? 6 : 5))
+      .join("\n")
+      .trim();
+    if (!data) return;
+    sawEvent = true;
+    if (data === "[DONE]" || finished) return;
+    let event;
+    try { event = JSON.parse(data); } catch { return; }
+    if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && event.delta.text) {
+      sawText = true;
+      text(event.delta.text);
+    } else if (event.type === "message_stop") {
+      finish(stop);
+    } else if (event.type === "error" || (event.error && !event.type)) {
+      finish(error, `上游返回错误：${clip(gatewayErrorText(event) || data)}`);
+    }
+  };
+  const feed = (chunk) => {
+    let next = (pendingCr ? "\r" : "") + chunk;
+    pendingCr = next.endsWith("\r");
+    if (pendingCr) next = next.slice(0, -1);
+    if (!sawEvent && raw.length < GATEWAY_RAW_LIMIT) raw += next;
+    buf += next.replace(/\r\n?/g, "\n");
+    let index;
+    while ((index = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, index);
+      buf = buf.slice(index + 2);
+      dispatch(block);
+    }
+  };
+  return {
+    write(chunk) {
+      feed(typeof chunk === "string" ? chunk : decoder.write(chunk));
+    },
+    end() {
+      feed(decoder.end() + (pendingCr ? "\n" : ""));
+      if (buf.trim()) dispatch(buf);
+      buf = "";
+      if (finished) return;
+      if (!sawEvent) {
+        // 不是 SSE：可能是网关忽略了 stream:true，回了整段 JSON（正常回复或错误）。
+        let value = null;
+        try { value = JSON.parse(raw); } catch {}
+        const message = gatewayErrorText(value);
+        if (value && (value.type === "error" || (value.error && !Array.isArray(value.content)))) {
+          return finish(error, `上游返回错误：${clip(message || raw)}`);
+        }
+        const blocks = Array.isArray(value?.content) ? value.content : [];
+        const reply = blocks.filter((block) => block?.type === "text").map((block) => block.text || "").join("");
+        if (reply) {
+          text(reply);
+          return finish(stop);
+        }
+        return finish(error, raw.trim()
+          ? `上游返回的不是流式回复：${clip(raw)}`
+          : "上游没有返回任何内容");
+      }
+      // 有的网关流完不发 message_stop；有文本就当正常结束。
+      if (sawText) return finish(stop);
+      return finish(error, "上游没有返回任何内容");
+    },
+  };
 }
 
 export function gatewayBody(config, raw) {
