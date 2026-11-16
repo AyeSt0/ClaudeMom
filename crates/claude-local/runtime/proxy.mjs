@@ -107,6 +107,20 @@ const dataManaged = runtime.managed && !POC_DIR;
 // 首次启动也不依赖能连上 claude.ai。没有模板时本来就这样；有模板时由 localShell 开关决定，
 // 关掉则沿用线上外壳（首次经出站代理抓取后写穿缓存）。
 const useOfficialShell = Boolean(officialShell) && (dataManaged || runtime.localShell);
+// 模板自带的页面外壳（mock/shell.html）：与模板数据同一次录制、同一个前端版本。
+// 有它时主站的页面导航一律用它，不看缓存、不去线上抓：线上页面会换版本，
+// 配上按旧版本录制的模板就会界面错乱、Code 页卡在加载（新用户没有缓存时必然拿到线上版本）。
+const TEMPLATE_SHELL = (() => {
+  if (!POC_DIR) return null;
+  try {
+    const body = fs.readFileSync(path.join(POC_MOCK, "shell.html"));
+    return body.length >= 4096 && /<html\b[^>]*\bdata-build-id="[^"]+"/i.test(body.subarray(0, 4096).toString("utf8"))
+      ? body
+      : null;
+  } catch {
+    return null;
+  }
+})();
 const READ_CACHE = POC_DIR ? path.join(POC_DIR, ".cache") : CACHE_DIR;
 const LOG = arg("log", "1") !== "0";
 const READY_FILE = process.env.CLAUDE_LOCAL_READY_FILE;
@@ -1916,6 +1930,21 @@ function handle(req, res, hostHeader) {
   if (MODE === "mock" && ["/", "/login", "/app-unavailable-in-region"].includes(url.pathname)) {
     res.writeHead(302, { location: "/new", "content-length": 0 });
     return res.end();
+  }
+  // 不看 Accept：Claude 加载主界面 /epitaxy 时不带 text/html，按 isDocNav 判断会漏掉、落到线上兜底。
+  if (
+    MODE === "mock" && TEMPLATE_SHELL && isMainClaudeHost &&
+    req.method === "GET" &&
+    !path.extname(url.pathname) &&
+    !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
+  ) {
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": TEMPLATE_SHELL.length,
+      "cache-control": "no-store",
+      ...(url.pathname === "/new" ? { "set-cookie": activeOrgCookies() } : {}),
+    });
+    return res.end(TEMPLATE_SHELL);
   }
   if (MODE === "mock" && url.pathname === "/new") {
     const key = crypto.createHash("sha1").update("claude.ai/login").digest("hex");

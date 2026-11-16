@@ -2,6 +2,7 @@
 // 从本机录制的 mock/ 数据生成可提交的“模板”副本（mock-template/）：
 // 保留 GrowthBook/statsig/模型选择器/计划与能力形状，替换所有个人字段为合成常量。
 // 用法：node sanitize-mock.mjs [srcDir=mock] [outDir=mock-template]
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -107,6 +108,28 @@ function run() {
     fs.writeFileSync(dest, JSON.stringify(sanitized, null, 2));
   }
   console.log(`sanitized ${jobs.length} files -> ${OUT}`);
+  exportShell();
+}
+
+// 页面外壳必须和模板数据是同一个前端版本（bootstrap.json 的 gated_imports_build_id），
+// 否则新用户会配上线上别的版本，界面错乱。从录制目录的 .cache（与 mock/ 同级）里找同版本的外壳。
+function exportShell() {
+  let buildId;
+  try {
+    buildId = JSON.parse(fs.readFileSync(path.join(OUT, "bootstrap.json"), "utf8")).gated_imports_build_id;
+  } catch {}
+  const cacheDir = path.join(path.dirname(SRC), ".cache");
+  for (const key of ["claude.ai/login", "claude.ai/epitaxy", "claude.ai/new", "claude.ai/"]) {
+    const file = path.join(cacheDir, crypto.createHash("sha1").update(key).digest("hex"));
+    let body;
+    try { body = fs.readFileSync(file); } catch { continue; }
+    const found = body.subarray(0, 4096).toString("utf8").match(/<html\b[^>]*\bdata-build-id="([^"]+)"/i)?.[1];
+    if (body.length < 4096 || !found || found !== buildId) continue;
+    fs.writeFileSync(path.join(OUT, "shell.html"), body);
+    console.log(`shell ${key} (build ${found}) -> ${path.join(OUT, "shell.html")}`);
+    return;
+  }
+  console.warn(`! 没在 ${cacheDir} 找到 build ${buildId ?? "（未知）"} 的页面外壳：mock-template/shell.html 缺失，新用户会拿到线上版本`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) run();

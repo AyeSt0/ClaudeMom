@@ -78,6 +78,12 @@ const ASSETS: &[(&str, &[u8])] = &[
         "mock/bootstrap.json",
         include_bytes!("../runtime/mock-template/bootstrap.json"),
     ),
+    // 与模板同一次录制的 claude.ai 页面外壳（公开页面，不含账号数据）。前端版本必须与
+    // bootstrap.json 的 gated_imports_build_id 一致，见 embedded_template_shell_matches_bootstrap。
+    (
+        "mock/shell.html",
+        include_bytes!("../runtime/mock-template/shell.html"),
+    ),
     (
         "mock/api/account_profile.json",
         include_bytes!("../runtime/mock-template/api/account_profile.json"),
@@ -2828,6 +2834,45 @@ server.listen(0,'127.0.0.1',()=>{
             serde_json::from_str::<Value>(&convos).unwrap()["data"],
             json!([])
         );
+    }
+
+    #[test]
+    fn embedded_template_shell_matches_bootstrap() {
+        // 模板外壳与模板数据必须是同一个前端版本：换了其中一个，界面会错乱、Code 页卡在加载。
+        let dir = tempfile::tempdir().unwrap();
+        install_assets(dir.path()).unwrap();
+        let shell = fs::read_to_string(dir.path().join("mock/shell.html")).unwrap();
+        let bootstrap: Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("mock/bootstrap.json")).unwrap(),
+        )
+        .unwrap();
+        let build_id = shell
+            .split("data-build-id=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("shell.html 没有 data-build-id");
+        assert_eq!(
+            bootstrap["gated_imports_build_id"].as_str(),
+            Some(build_id),
+            "mock-template/shell.html 与 bootstrap.json 不是同一次录制"
+        );
+        // 公开页面：不得带账号 uuid、邮箱（公共支持邮箱除外）或 API key。
+        assert!(!shell.contains("sk-ant"));
+        let is_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit());
+        let uuid_like = shell.as_bytes().windows(36).any(|w| {
+            let s = std::str::from_utf8(w).unwrap_or("");
+            let parts: Vec<&str> = s.split('-').collect();
+            parts.len() == 5
+                && [8, 4, 4, 4, 12].iter().zip(&parts).all(|(n, p)| p.len() == *n && is_hex(p))
+        });
+        assert!(!uuid_like, "shell.html 里不应有 uuid");
+        for word in shell.split(|c: char| c.is_whitespace() || "\"'<>(),;".contains(c)) {
+            if let Some((local, domain)) = word.split_once('@') {
+                if !local.is_empty() && domain.contains('.') && domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+                    assert!(domain.ends_with("anthropic.com"), "unexpected email in shell.html: {word}");
+                }
+            }
+        }
     }
 
     #[test]

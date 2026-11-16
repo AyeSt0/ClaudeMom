@@ -348,6 +348,55 @@ test("installed template fetches the first shell through the configured upstream
   }
 });
 
+test("installed template with its own shell never serves an online or cached shell of another build", async () => {
+  // 新用户没有缓存时会从 claude.ai 拉到当前线上版本，与按旧版本录制的模板对不上（界面错乱、Code 页卡住）。
+  // 模板自带同一次录制的外壳时，主站页面导航一律用它；已经缓存了线上新版本的老用户也恢复。
+  const connects = [];
+  const upstreamProxy = http.createServer();
+  upstreamProxy.on("connect", (req, socket) => {
+    connects.push(req.url);
+    socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  const runtimeDir = path.join(root, "template-shell-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
+  fs.writeFileSync(path.join(runtimeDir, "mock", "shell.html"), `<!doctype html><html data-build-id="template-build"><head></head><body>${"t".repeat(5000)}</body></html>`);
+  // 缓存里已经有线上新版本的外壳（之前没有模板外壳时写穿的）。
+  const cacheDir = path.join(runtimeDir, ".cache");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  for (const key of ["claude.ai/epitaxy", "claude.ai/login"]) {
+    const file = path.join(cacheDir, crypto.createHash("sha1").update(key).digest("hex"));
+    fs.writeFileSync(file, `<html data-build-id="online-build">${"o".repeat(5000)}</html>`);
+    fs.writeFileSync(`${file}.json`, JSON.stringify({ status: 200, headers: { "content-type": "text/html" }, url: key }));
+  }
+  const instance = await start({
+    CLAUDE_LOCAL_CACHE_DIR: cacheDir,
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+  }, runtimeDir);
+  try {
+    for (const pathname of ["/new", "/epitaxy", "/settings/general", "/chat/abc"]) {
+      // Claude 加载主界面 /epitaxy 时 Accept 不带 text/html：两种都要用模板外壳。
+      for (const accept of ["text/html", "*/*"]) {
+        const shell = await request(instance, pathname, { host: "claude.ai", extraHeaders: { accept } });
+        assert.equal(shell.status, 200, `${pathname} (${accept})`);
+        assert.match(shell.bytes.toString("utf8"), /data-build-id="template-build"/, `${pathname} (${accept})`);
+      }
+    }
+    const root302 = await request(instance, "/", { host: "claude.ai", extraHeaders: { accept: "text/html" } });
+    assert.equal(root302.status, 302);
+    // 接口请求不受影响。
+    const bootstrap = await request(instance, "/edge-api/bootstrap", { host: "claude.ai" });
+    assert.equal(bootstrap.status, 200);
+    assert.ok(bootstrap.json);
+    assert.deepEqual(connects, [], "模板自带外壳时不去线上抓");
+  } finally {
+    await stop(instance);
+    upstreamProxy.close();
+  }
+});
+
 test("installed template serves the local official shell when the experimental switch is on", async () => {
   // 线上外壳引用的资源与本机 ion-dist 对不上，首次启动会补拉上千个文件；实验开关打开时改用本机外壳。
   const connects = [];
