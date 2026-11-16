@@ -40,6 +40,8 @@ const localizationShim = runtime.managed && !runtime.recordedDir && runtime.loca
   ? fs.readFileSync(path.join(here, "page-shim.js"))
   : null;
 
+const LOCAL_CATALOG_VERSION = "local.local";
+
 function addLocalizationShim(html, officialLocales) {
   if (!localizationShim) return html;
   const head = /<head\b[^>]*>/i.exec(html);
@@ -56,10 +58,12 @@ function addLocalizationShim(html, officialLocales) {
     const match = entry.trim().match(/^([\w-]+):([\w-]+)\.([\w-]+)$/);
     if (match) catalogs.set(match[1], `${match[2]}.${match[3]}`);
   }
+  // 版本号必须是「基础词表.动态词表」两段：前端按 /^([\w-]+):([\w-]+)\.([\w-]+)$/ 解析，
+  // 以前写的 1.1.1 是三段，整张表都解析失败、语言列表变空，界面就退回英文。
   for (const locale of officialLocales) {
-    if (!catalogs.has(locale)) catalogs.set(locale, "1.1.1");
+    if (!catalogs.has(locale)) catalogs.set(locale, LOCAL_CATALOG_VERSION);
   }
-  catalogs.set("zh-Hans", catalogs.get("zh-Hans") ?? "1.1.1");
+  catalogs.set("zh-Hans", catalogs.get("zh-Hans") ?? LOCAL_CATALOG_VERSION);
   const catalogValue = [...catalogs]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([locale, versions]) => `${locale}:${versions}`)

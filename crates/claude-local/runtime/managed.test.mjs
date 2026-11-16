@@ -267,7 +267,10 @@ test("fresh managed profile serves the installed official shell and bounded ASAR
   const shellHtml = shell.bytes.toString("utf8");
   assert.match(shellHtml, /data-build-id="fixture-build"/);
   assert.doesNotMatch(shellHtml, /stale private login shell/);
-  assert.match(shellHtml, /<meta name="i18n-catalogs" data-i18n-catalogs="en-US:1\.1\.1,zh-Hans:1\.1\.1">/);
+  assert.match(shellHtml, /<meta name="i18n-catalogs" data-i18n-catalogs="en-US:local\.local,zh-Hans:local\.local">/);
+  // 前端按 locale:基础.动态 两段解析版本号（三段会整张表解析失败，界面退回英文）。
+  const catalogs = shellHtml.match(/data-i18n-catalogs="([^"]+)"/)[1].split(",");
+  assert.ok(catalogs.every((entry) => /^([\w-]+):([\w-]+)\.([\w-]+)$/.test(entry)), catalogs.join(","));
   const shimIndex = shellHtml.indexOf('<script src="/__codex_plus/claude-localization.js"></script>');
   const firstAppScript = shellHtml.indexOf("<script>");
   assert.ok(shellHtml.indexOf('name="i18n-catalogs"') < firstAppScript);
