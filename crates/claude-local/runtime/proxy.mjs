@@ -103,15 +103,43 @@ const CACHE_DIR = process.env.CLAUDE_LOCAL_CACHE_DIR || path.join(here, ".cache"
 // 代理目录里来历不明的 mock 一律忽略（托管测试用 privateFixture 守住这条）。
 const TRUSTED_TEMPLATE = fs.existsSync(path.join(here, "mock", ".codex-plus-template"));
 const POC_DIR = runtime.recordedDir || (TRUSTED_TEMPLATE ? here : null);
-const POC_MOCK = path.join(POC_DIR ?? here, "mock");
+// 模板按录制版本放在 mock/<build>/（每个前端版本一组接口数据 + 页面外壳）。设置里选了哪个用哪个，
+// 没选或选的已经下架就用最新的（按外壳里的 data-build-timestamp）。没有版本目录时是旧的平铺布局
+// （开发用的录制目录 CLAUDE_LOCAL_RECORDED_DIR 也是这样），直接用 mock/。
+const TEMPLATE_ROOT = path.join(POC_DIR ?? here, "mock");
+function templateBuildTime(dir) {
+  try {
+    const head = fs.readFileSync(path.join(dir, "shell.html")).subarray(0, 4096).toString("utf8");
+    return Number(head.match(/\bdata-build-timestamp="(\d+)"/)?.[1]) || 0;
+  } catch {
+    return -1;
+  }
+}
+function pickTemplate() {
+  if (!POC_DIR) return TEMPLATE_ROOT;
+  let versions = [];
+  try {
+    versions = fs.readdirSync(TEMPLATE_ROOT, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^[\w-]+$/.test(entry.name) &&
+        fs.existsSync(path.join(TEMPLATE_ROOT, entry.name, "bootstrap.json")))
+      .map((entry) => entry.name);
+  } catch {}
+  if (!versions.length) return TEMPLATE_ROOT;
+  if (runtime.template && versions.includes(runtime.template)) return path.join(TEMPLATE_ROOT, runtime.template);
+  const newest = versions
+    .map((name) => ({ name, time: templateBuildTime(path.join(TEMPLATE_ROOT, name)) }))
+    .sort((a, b) => b.time - a.time || a.name.localeCompare(b.name))[0].name;
+  return path.join(TEMPLATE_ROOT, newest);
+}
+const POC_MOCK = pickTemplate();
 const POC_I18N = path.join(POC_DIR ?? here, "i18n");
 // 托管模式在存在 PoC 数据（dev 录制目录或安装的内嵌 mock 模板）时走 PoC 数据路径；
 // 完全没有模板数据时保持合成兜底（officialShell/localBootstrap + 状态告警）。
 const dataManaged = runtime.managed && !POC_DIR;
 // 页面外壳用本机 Claude 自带的版本（ion-dist）：资源都在本地，不用每逢线上换版本就补拉上千个文件，
-// 首次启动也不依赖能连上 claude.ai。没有模板时本来就这样；有模板时由 localShell 开关决定，
-// 关掉则沿用线上外壳（首次经出站代理抓取后写穿缓存）。
-const useOfficialShell = Boolean(officialShell) && (dataManaged || runtime.localShell);
+// 首次启动也不依赖能连上 claude.ai。只在没有模板数据时这样用：本机这份是 Claude 第三方模式的界面，
+// 配上按 claude.ai 录制的模板数据对不上；要用它请选「本机版」界面（第三方模式启动）。
+const useOfficialShell = Boolean(officialShell) && dataManaged;
 // 模板自带的页面外壳（mock/shell.html）：与模板数据同一次录制、同一个前端版本。
 // 有它时主站的页面导航一律用它，不看缓存、不去线上抓：线上页面会换版本，
 // 配上按旧版本录制的模板就会界面错乱、Code 页卡在加载（新用户没有缓存时必然拿到线上版本）。
@@ -127,6 +155,7 @@ const TEMPLATE_SHELL = (() => {
   }
 })();
 const READ_CACHE = POC_DIR ? path.join(POC_DIR, ".cache") : CACHE_DIR;
+
 const LOG = arg("log", "1") !== "0";
 const READY_FILE = process.env.CLAUDE_LOCAL_READY_FILE;
 const INSTANCE_ID = process.env.CLAUDE_LOCAL_INSTANCE_ID || crypto.randomUUID();
@@ -761,8 +790,8 @@ function forceCowork(result, template) {
   };
 }
 
-// claude_ai_hub_web_delivery：Claude 的新版主页，对话和 Cowork 合在一个输入框里，没有「对话 | Cowork」切换。
-// 录制模板的账号在 chatwork_free_experiment 实验组里，这个开关是开的。设置里没选新版主页时关掉它，
+// claude_ai_hub_web_delivery：Claude 的合并式主页，对话和 Cowork 合在一个输入框里，没有「对话 | Cowork」切换。
+// 录制模板的账号在 chatwork_free_experiment 实验组里，这个开关是开的。设置里没选合并式主页时关掉它，
 // 用回有切换的经典主页。
 const HUB_DELIVERY_FEATURE_ID = "2436273311";
 function useClassicHome(result, template) {
@@ -772,7 +801,7 @@ function useClassicHome(result, template) {
       features: { ...result.org_growthbook.features, [HUB_DELIVERY_FEATURE_ID]: { defaultValue: false } },
     };
   }
-  // 新版主页的代码是按 gated_imports 下发的，光关 GrowthBook 开关不够：前端看到这一项仍会装上它。
+  // 合并式主页的代码是按 gated_imports 下发的，光关 GrowthBook 开关不够：前端看到这一项仍会装上它。
   if (result.gated_imports?.claude_ai_hub_web_delivery) {
     const { claude_ai_hub_web_delivery: _hub, ...rest } = result.gated_imports;
     result.gated_imports = rest;
@@ -780,6 +809,16 @@ function useClassicHome(result, template) {
 }
 
 let resolvedBootstrapCache;
+// 主页问候语里带着称呼：模板里是「Local User」（脱敏时换的），按设置里的用户名换掉。
+const TEMPLATE_DISPLAY_NAME = "Local User";
+function withDisplayName(value) {
+  if (displayName === TEMPLATE_DISPLAY_NAME) return value;
+  if (typeof value === "string") return value.split(TEMPLATE_DISPLAY_NAME).join(displayName);
+  if (Array.isArray(value)) return value.map(withDisplayName);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, withDisplayName(item)]));
+  return value;
+}
+
 function resolvedBootstrap() {
   if (resolvedBootstrapCache) return resolvedBootstrapCache;
   let template = RECORDED_BOOTSTRAP ?? {};
@@ -794,6 +833,9 @@ function resolvedBootstrap() {
     ...result.served_copy,
     "web.plan_name.max_20x": runtime.localization ? "Codex++ 本地网关" : "Codex++ local gateway",
   };
+  // 录制账号自己的状态，不属于本地模式：身份验证待办（hold_notice）会让 Claude 弹「完成验证以继续」、拦掉回复。
+  result.hold_notice = null;
+  result.personalized_greeting = withDisplayName(result.personalized_greeting);
   if (runtime.cowork) forceCowork(result, template);
   if (!runtime.hubHome) useClassicHome(result, template);
   if (useOfficialShell) {
