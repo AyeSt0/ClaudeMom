@@ -268,6 +268,19 @@ export function createGatewayStreamParser({ text, stop, error }) {
   };
 }
 
+/**
+ * 凭据文件是否只有当前用户能读：普通文件、不是链接、属主是自己、其他人没有权限。
+ * Windows 上 lstat 的 mode 恒为 0o666、没有 uid，POSIX 权限位不反映 ACL，
+ * 按它校验必然失败（听写一直 503，#16）；那里只检查是普通文件、不是链接，
+ * 权限交给所在的用户目录（%APPDATA%）自身的 ACL。
+ */
+export function isPrivateFile(metadata, { platform = process.platform, uid = process.getuid?.() } = {}) {
+  if (!metadata.isFile() || metadata.isSymbolicLink()) return false;
+  if (platform === "win32") return true;
+  if ((metadata.mode & 0o077) !== 0) return false;
+  return uid === undefined || metadata.uid === uid;
+}
+
 export function gatewayBody(config, raw) {
   const value = JSON.parse(raw.toString("utf8"));
   if (!isRecord(value)) throw new Error("Invalid model request");

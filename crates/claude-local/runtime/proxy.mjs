@@ -27,7 +27,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -1501,6 +1501,14 @@ function mockApi(req, res, url) {
     });
     return;
   }
+  // 这两个接口 Claude 用 zod 校验：通用兜底的 {} 会报「Invalid BFF response format」，
+  // Cowork 提交任务时直接中断（来自 PR #8 的排查）。
+  if (method === "GET" && p === "/api/directory/servers") {
+    return json(res, { servers: [], next_cursor: null });
+  }
+  if (method === "GET" && /^\/api\/organizations\/[^/]+\/activation\/[^/]+\/tasks$/.test(p)) {
+    return json(res, { tasks: [] });
+  }
   if (/\/completion_status/.test(p)) {
     return json(res, { is_pending: false, is_error: false });
   }
@@ -2365,9 +2373,7 @@ function dictationLanguage(requestUrl) {
 function readDictationReceipt() {
   const receiptPath = path.join(APP_STATE_DIR, "dictation-helper.json");
   try {
-    const metadata = fs.lstatSync(receiptPath);
-    if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) return null;
-    if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) return null;
+    if (!isPrivateFile(fs.lstatSync(receiptPath))) return null;
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
     if (
       !Number.isInteger(receipt.port) || receipt.port < 1 || receipt.port > 65535 ||

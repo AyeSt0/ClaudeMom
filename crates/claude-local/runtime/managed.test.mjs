@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, gatewayModel, gatewayTarget, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -974,6 +974,26 @@ function sseEvents(bytes) {
     return { event, data: data ? JSON.parse(data) : null };
   });
 }
+
+test("credential files are private by POSIX mode and owner, and by file type alone on Windows", () => {
+  const file = (mode, uid = 501, { link = false, regular = true } = {}) => ({
+    mode, uid, isFile: () => regular, isSymbolicLink: () => link,
+  });
+  assert.equal(isPrivateFile(file(0o100600), { platform: "darwin", uid: 501 }), true);
+  assert.equal(isPrivateFile(file(0o100644), { platform: "darwin", uid: 501 }), false);
+  assert.equal(isPrivateFile(file(0o100600, 0), { platform: "darwin", uid: 501 }), false);
+  // Windows：lstat 的 mode 恒为 0o666、uid 为 0，以前按 POSIX 校验必然失败，听写 503。
+  assert.equal(isPrivateFile(file(0o100666, 0), { platform: "win32", uid: undefined }), true);
+  assert.equal(isPrivateFile(file(0o100666, 0, { link: true }), { platform: "win32", uid: undefined }), false);
+  assert.equal(isPrivateFile(file(0o40666, 0, { regular: false }), { platform: "win32", uid: undefined }), false);
+});
+
+test("Cowork BFF lists keep the shapes Claude validates", async () => {
+  const servers = await request(service, "/api/directory/servers?limit=5000&visibility=public", { host: "claude.ai" });
+  assert.deepEqual(servers.json, { servers: [], next_cursor: null });
+  const tasks = await request(service, "/api/organizations/local/activation/cowork/tasks", { host: "claude.ai" });
+  assert.deepEqual(tasks.json, { tasks: [] });
+});
 
 test("REST completions show the upstream's error in the reply and end the stream properly", async () => {
   const completion = async (conv, prompt) => {
