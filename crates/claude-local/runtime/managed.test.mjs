@@ -506,8 +506,10 @@ test("upstream fetches share a bounded, reused connection pool through the upstr
     assert.ok(connects.length <= 16, `60 个并发请求开了 ${connects.length} 条隧道，应不超过 16`);
     assert.ok(connects.every((target) => target === "assets-proxy.anthropic.com:443"));
     const opened = connects.length;
-    for (let i = 0; i < 5; i++) assert.equal((await fetchAsset(`later-${i}`)).status, 200);
+    for (let i = 0; i < 40; i++) assert.equal((await fetchAsset(`later-${i}`)).status, 200);
     assert.equal(connects.length, opened, "之后的请求复用已有连接，不再新开隧道");
+    // 同一条复用的连接上跑过几十个请求，不能每次都往 socket 上叠监听器（#16 看到过这个警告）。
+    assert.equal(instance.output().includes("MaxListenersExceededWarning"), false, instance.output());
   } finally {
     await stop(instance);
     upstreamProxy.closeAllConnections();
