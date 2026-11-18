@@ -796,11 +796,19 @@ function restTime(value, fallback) {
  * 两边都要能读出来，否则从另一条路径建的会话打开就是空的。
  */
 function restMessages(c) {
-  if (c.chat_messages?.length) return c.chat_messages;
+  // 旧版状态文件可能把数组字段缺省或显式置为 null；新版前端会直接对其调用 .some()/.map()。
+  const withArrays = (message) => ({
+    ...message,
+    files: Array.isArray(message?.files) ? message.files : [],
+    files_v2: Array.isArray(message?.files_v2) ? message.files_v2 : [],
+    attachments: Array.isArray(message?.attachments) ? message.attachments : [],
+    sync_sources: Array.isArray(message?.sync_sources) ? message.sync_sources : [],
+  });
+  if (c.chat_messages?.length) return c.chat_messages.map(withArrays);
   const messages = [];
   for (const turn of c.turns || []) {
     const created = restTime(turn.created, c.created_at);
-    const entry = (uuid, sender, index, parent, text, extra = {}) => ({
+    const entry = (uuid, sender, index, parent, text, extra = {}) => withArrays({
       uuid, sender, index, parent_message_uuid: parent ?? null, text,
       content: [{ type: "text", text, citations: [] }],
       created_at: created, updated_at: created, ...extra,
@@ -826,6 +834,14 @@ function convToRest(c, { messages = false } = {}) {
   const title = c.name && c.name !== "New conversation" ? c.name : "";
   return {
     ...REST_CONV_TEMPLATE,
+    // 新版前端会对这些字段直接调用数组/对象操作；录制的 conversations.json 可能为空，
+    // 而旧模板字段也可能是 null，因此本地 API 必须保证返回正确形状。
+    settings: REST_CONV_TEMPLATE.settings && typeof REST_CONV_TEMPLATE.settings === "object" ? REST_CONV_TEMPLATE.settings : {},
+    project_uuid: REST_CONV_TEMPLATE.project_uuid ?? null,
+    is_starred: REST_CONV_TEMPLATE.is_starred ?? false,
+    is_archived: REST_CONV_TEMPLATE.is_archived ?? false,
+    files: Array.isArray(REST_CONV_TEMPLATE.files) ? REST_CONV_TEMPLATE.files : [],
+    sync_sources: Array.isArray(REST_CONV_TEMPLATE.sync_sources) ? REST_CONV_TEMPLATE.sync_sources : [],
     uuid: c.uuid,
     id: c.uuid,
     name: title,
@@ -1124,6 +1140,17 @@ function mockApi(req, res, url) {
     });
   }
 
+  // 插件安装状态核对：客户端要求 `checked` 数组；通用 library 分页结构会触发加载错误。
+  if (method === "POST" && /^\/api\/organizations\/[^/]+\/library\/plugins\/installed_check$/.test(p)) {
+    return json(res, { checked: [] });
+  }
+  // 本地 mock 没有官方插件元数据或下载包；返回 API 能识别的 not-found，而不是 200 + {}，
+  // 这样详情页能处理明确的缺失状态，不会把空对象当成功插件数据渲染。
+  if (method === "GET" && /^\/api\/organizations\/[^/]+\/plugins\/(?:by-name\/[^/]+|[^/]+)$/.test(p) &&
+      !/\/plugins\/(?:list-plugins|registry)$/.test(p)) {
+    return json(res, { error: { details: { error_code: "plugin_not_found" } } }, 404);
+  }
+
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
   // 列表页校验（shared-l-p-m-w-0 rG）：{data:[...], pagination:{has_more:boolean}} 必须成立
@@ -1174,7 +1201,9 @@ function mockApi(req, res, url) {
   if (/\/marketplaces\//.test(p)) {
     return json(res, { ...pageShape, marketplaces: [] });
   }
+  if (method === "GET" && p === "/api/frame/types") return json(res, { ...pageShape, types: [] });
   if (p.startsWith("/api/frame/")) return json(res, pageShape);
+  if (method === "GET" && /^\/api\/organizations\/[^/]+\/plugins\/registry$/.test(p)) return json(res, { data: [] });
   // 客户端按 plugin id 读取元数据字典，每个值都必须是对象。
   if (p.endsWith("/cowork_plugin_metadata")) return json(res, {});
 
