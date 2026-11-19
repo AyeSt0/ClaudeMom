@@ -149,19 +149,35 @@ export function gatewayTarget(config, requestPath) {
   return target;
 }
 
-export function gatewayModel(config, requested) {
-  if (!requested) return config.model;
-  if (config.models.includes(requested)) return requested;
+const WINDOW_SUFFIX = /\[\d+[km]\]$/i;
 
-  const stripTag = (id) => String(id || "").replace(/\[.*?\]$/, "");
-  const target = stripTag(requested);
-  const matched = config.models.find((id) => {
-    if (id === requested) return true;
-    const stripped = stripTag(id);
-    return stripped === target ||
-      stripped.endsWith(`.${target}`) ||
-      stripped.endsWith(`/${target}`);
-  });
+function uniqueModelAlias(models, requested) {
+  const target = requested.replace(WINDOW_SUFFIX, "");
+  if (!target) return;
+  const suffix = requested.slice(target.length).toLowerCase();
+  let bestRank = 0;
+  let match;
+  for (const id of models) {
+    const name = id.replace(WINDOW_SUFFIX, "");
+    const candidateSuffix = id.slice(name.length).toLowerCase();
+    if (suffix && candidateSuffix && suffix !== candidateSuffix) continue;
+    const fullName = name === target;
+    if (!fullName && !name.endsWith(`.${target}`) && !name.endsWith(`/${target}`)) continue;
+    const rank = (fullName ? 3 : 1) + Number(suffix !== "" && suffix === candidateSuffix);
+    if (rank > bestRank) {
+      bestRank = rank;
+      match = id;
+    } else if (rank === bestRank) {
+      match = undefined;
+    }
+  }
+  return match;
+}
+
+export function gatewayModel(config, requested) {
+  if (typeof requested !== "string" || !requested) return config.model;
+  if (config.models.includes(requested)) return requested;
+  const matched = uniqueModelAlias(config.models, requested);
   if (matched) return matched;
 
   if (/^(?:claude-)?haiku(?:-|$)/i.test(requested)) return config.smallModel;
