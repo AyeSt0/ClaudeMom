@@ -33,7 +33,6 @@ let dictationCacheDir;
 let dictationAssetPath;
 let dictationUpgrade;
 let dictationFrame;
-let deadUpstreamPort;
 const streamFixtureSize = 4 * 1024 * 1024;
 let streamFixture;
 let streamFixtureReady;
@@ -337,6 +336,7 @@ before(async () => {
   // 假上游：记录代理转发过来的 host 头与路径
   upstreamFixture = http.createServer((req, res) => {
     upstreamRequests.push({ host: req.headers.host, url: req.url });
+    if (req.url === "/upstream-failure-fixture") return req.socket.destroy();
     if (req.url.startsWith("/stream-fixture/")) {
       // 先发一段就停住，等测试放行才发完：本地服务必须边收边转，不能等整包到齐。
       res.writeHead(200, { "content-type": "application/octet-stream", "content-length": streamFixtureSize });
@@ -360,10 +360,6 @@ before(async () => {
     res.end(JSON.stringify({ ok: true, host: req.headers.host, url: req.url }));
   });
   upstreamFixturePort = await listen(upstreamFixture);
-  // 一个连不上的上游端口：验证上游失败时兜底响应本身要能被跨域调用方读到。
-  const deadReservation = net.createServer();
-  deadUpstreamPort = await listen(deadReservation);
-  await new Promise((resolve) => deadReservation.close(resolve));
   const reservation = net.createServer();
   proxyPort = await listen(reservation);
   await new Promise((resolve) => reservation.close(resolve));
@@ -376,7 +372,6 @@ before(async () => {
       CLAUDE_LOCAL_UPSTREAM_MAP: JSON.stringify({
         "downloads.claude.ai": `http://127.0.0.1:${upstreamFixturePort}`,
         "assets-proxy.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
-        "statsig.anthropic.com": `http://127.0.0.1:${deadUpstreamPort}`,
       }),
       CLAUDE_LOCAL_CACHE_DIR: dictationCacheDir,
       CLAUDE_LOCAL_STATE_FILE: path.join(dictationStateDir, "conversation-state.json"),
@@ -727,21 +722,17 @@ test("upstream requests keep their original host instead of being rewritten to c
   assert.equal(seen.url, "/claude-code-releases/2.1.317/darwin-arm64/claude.app.tar.zst");
 });
 
-test("upstream failures stay readable for cross-origin callers instead of surfacing as CORS errors", async () => {
-  // 上游连不上时，兜底响应是本代理自己生成的：跨域请求必须带上 CORS，否则 Claude 前端只能看到
-  // 「No 'Access-Control-Allow-Origin' header」，上游不可用这个真实原因被吃掉（实测一次启动能刷出
-  // 900 多条这种 CORS 报错，界面直接进错误边界）。
-  const crossOrigin = await requestText("statsig.anthropic.com", "/v1/collect", { origin: "https://claude.ai" });
-  assert.equal(crossOrigin.status, 502);
-  assert.equal(crossOrigin.headers["access-control-allow-origin"], "https://claude.ai");
-  assert.equal(crossOrigin.headers["vary"], "origin");
-  assert.match(crossOrigin.body, /upstream unavailable/);
-
-  // 没带 Origin 的调用方（非浏览器 / 同源）给通配值，行为不变。
-  const withoutOrigin = await requestText("statsig.anthropic.com", "/v1/collect");
-  assert.equal(withoutOrigin.status, 502);
-  assert.equal(withoutOrigin.headers["access-control-allow-origin"], "*");
-  assert.match(withoutOrigin.body, /upstream unavailable/);
+test("only the Desktop web origins can read the proxy's upstream failures across origins", async () => {
+  for (const [origin, allowed] of [["https://claude.ai", true], ["https://claude.com", true],
+    ["https://example.org", false], ["https://claude.ai.example.org", false], ["null", false], [undefined, false]]) {
+    const failure = await requestText("assets-proxy.anthropic.com", "/upstream-failure-fixture", origin ? { origin } : {});
+    assert.equal(failure.status, 502);
+    assert.equal(failure.headers["access-control-allow-origin"], allowed ? origin : undefined);
+    assert.equal(failure.headers["access-control-allow-credentials"], allowed ? "true" : undefined);
+    assert.equal(failure.headers.vary.toLowerCase(), "origin");
+    assert.equal(failure.headers["cache-control"], "no-store");
+    assert.match(failure.body, /upstream unavailable/);
+  }
 });
 
 async function openDownload(host, pathname) {

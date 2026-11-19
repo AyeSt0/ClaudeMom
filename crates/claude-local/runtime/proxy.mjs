@@ -170,7 +170,7 @@ const MAX_DICTATION_WS_DURATION_MS = 16 * 60_000;
 // compliance_taints 可选数组，defaults 可选对象。
 const POLICY_LIMITS = { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null };
 const DICTATION_ALLOWED_HOSTS = new Set(["claude.ai", "claude.com", "api.anthropic.com"]);
-const DICTATION_ALLOWED_ORIGINS = new Set(["https://claude.ai", "https://claude.com"]);
+const DESKTOP_WEB_ORIGINS = new Set(["https://claude.ai", "https://claude.com"]);
 let lastClientAt = null;
 let listeningPort = PORT;
 let persistenceWarning = null;
@@ -1872,29 +1872,17 @@ function upstreamRequest(target, options, callback) {
   return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
 }
 
-/**
- * 上游失败时兜底响应的头部。
- *
- * 响应体是本代理自己生成的，跨域调用方（页面里的统计上报、CDN 以外的资源域名等）必须能读到状态和
- * 原因。以前这里只给了 content-type，前端只能看到「No 'Access-Control-Allow-Origin' header」，
- * 上游不可用被误报成 CORS 问题——实测一次启动能刷出 900 多条这种报错，界面直接进错误边界。
- *
- * 带 Origin 时回显它（并允许凭据：通配值在凭据请求里会被浏览器直接拒掉），没带 Origin 的调用方给
- * 通配值，和静态资源那几条本地响应保持一致。
- */
 function upstreamFailureHeaders(req) {
   const result = {
     "content-type": "text/plain; charset=utf-8",
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
+    "vary": "Origin",
   };
-  const origin = typeof req.headers.origin === "string" ? req.headers.origin.trim() : "";
-  if (origin && !origin.includes(",")) {
+  const origin = req.headers.origin;
+  if (DESKTOP_WEB_ORIGINS.has(origin)) {
     result["access-control-allow-origin"] = origin;
     result["access-control-allow-credentials"] = "true";
-    result["vary"] = "origin";
-  } else {
-    result["access-control-allow-origin"] = "*";
   }
   return result;
 }
@@ -2487,7 +2475,7 @@ function handleDictationUpgrade(req, clientSocket, head) {
       origin.pathname !== "/" ||
       origin.search ||
       origin.hash ||
-      !DICTATION_ALLOWED_ORIGINS.has(origin.origin)
+      !DESKTOP_WEB_ORIGINS.has(origin.origin)
     ) {
       return rejectUpgrade(clientSocket, "403 Forbidden", "forbidden");
     }
