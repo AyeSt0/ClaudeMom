@@ -150,9 +150,22 @@ export function gatewayTarget(config, requestPath) {
 }
 
 export function gatewayModel(config, requested) {
+  if (!requested) return config.model;
   if (config.models.includes(requested)) return requested;
-  if (/^(?:claude-)?haiku(?:-|$)/i.test(requested || "")) return config.smallModel;
-  if (config.managed || !requested || /^(?:claude-|sonnet|opus|haiku)/i.test(requested)) return config.model;
+
+  const stripTag = (id) => String(id || "").replace(/\[.*?\]$/, "");
+  const target = stripTag(requested);
+  const matched = config.models.find((id) => {
+    if (id === requested) return true;
+    const stripped = stripTag(id);
+    return stripped === target ||
+      stripped.endsWith(`.${target}`) ||
+      stripped.endsWith(`/${target}`);
+  });
+  if (matched) return matched;
+
+  if (/^(?:claude-)?haiku(?:-|$)/i.test(requested)) return config.smallModel;
+  if (config.managed || /^(?:claude-|sonnet|opus|haiku)/i.test(requested)) return config.model;
   return requested;
 }
 
