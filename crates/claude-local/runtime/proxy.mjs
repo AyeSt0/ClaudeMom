@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
 import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
-import { createOfficialAssets } from "./official-assets.mjs";
+import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const runtime = runtimeConfig();
@@ -308,6 +308,37 @@ function loadRecordedBootstrap() {
 }
 
 const RECORDED_BOOTSTRAP = loadRecordedBootstrap();
+
+// Cowork 的系统提示词由官方桌面端通过 system_prompts.cowork_system_prompt 下发。
+// 本地 mock 缺这一项时，渲染端拿到的提示词是空的，会直接报「Cowork 目前不可用」。
+// 优先从本机 app.asar 读（不在仓库里分发官方文本），读不到时用下面的兜底文案。
+const FALLBACK_COWORK_SYSTEM_PROMPT = [
+  "<application_details>",
+  "Claude is operating as an agent inside the Claude desktop app. The agent is built on Claude Code and the Claude Agent SDK, but Claude should not present itself as Claude Code.",
+  "</application_details>",
+  "",
+  "<claude_behavior>",
+  "Work directly on the user's task with the file tools and the sandboxed Linux shell. Prefer the file tools for reading and writing files; use the shell for commands. Save deliverables in the workspace folder the user selected, and keep internal sandbox paths out of user-facing explanations unless they are relevant.",
+  "</claude_behavior>",
+].join("\n");
+let coworkSystemPromptCache;
+function coworkSystemPrompt() {
+  if (coworkSystemPromptCache !== undefined) return coworkSystemPromptCache;
+  const prompt = loadCoworkSystemPrompt(process.env.CLAUDE_LOCAL_DESKTOP_RESOURCES, process.env.CLAUDE_LOCAL_COWORK_PROMPT_FILE);
+  coworkSystemPromptCache = prompt || FALLBACK_COWORK_SYSTEM_PROMPT;
+  return coworkSystemPromptCache;
+}
+function coworkSystemPrompts() {
+  return {
+    cowork_system_prompt: {
+      value: { prompt: coworkSystemPrompt() },
+      on: true,
+      off: false,
+      source: "defaultValue",
+      ruleId: null,
+    },
+  };
+}
 
 // i18n 字典：.cache 里录制过的真实翻译文件（url 形如 claude.ai/i18n/s/zh-Hans.json?v=...）
 const i18nMap = (() => {
@@ -763,7 +794,10 @@ function resolvedBootstrap() {
   // 录制账号自己的状态，不属于本地模式：身份验证待办（hold_notice）会让 Claude 弹「完成验证以继续」、拦掉回复。
   result.hold_notice = null;
   result.personalized_greeting = withDisplayName(result.personalized_greeting);
-  if (runtime.cowork) forceCowork(result, template);
+  if (runtime.cowork) {
+    result.system_prompts = { ...result.system_prompts, ...coworkSystemPrompts() };
+    forceCowork(result, template);
+  }
   if (!runtime.hubHome) useClassicHome(result, template);
   if (useOfficialShell) {
     // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
@@ -1290,6 +1324,9 @@ function mockApi(req, res, url) {
 
   if (p === "/api/bootstrap" || p === "/api/account" || p === "/api/account_profile") {
     return jsonWithActiveOrg(res, resolvedBootstrap());
+  }
+  if (method === "GET" && /^\/api\/bootstrap\/[^/]+\/system_prompts$/.test(p)) {
+    return json(res, resolvedBootstrap().system_prompts ?? {});
   }
   if (/^\/api\/bootstrap\/[^/]+\/app_start$/.test(p)) {
     return jsonWithActiveOrg(res, resolvedBootstrap());

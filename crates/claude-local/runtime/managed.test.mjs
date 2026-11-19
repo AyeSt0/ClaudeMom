@@ -14,7 +14,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
-import { createOfficialAssets } from "./official-assets.mjs";
+import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
 import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -510,6 +510,46 @@ test("upstream fetches share a bounded, reused connection pool through the upstr
   }
 });
 
+test("loadCoworkSystemPrompt extracts the cowork prompt from app.asar", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-app-"));
+  try {
+    fs.writeFileSync(path.join(dir, "app.asar"), [
+      ' '.repeat(1024 * 1024 - 24),
+      'var t = `<application_details>\\nClaude is operating as an agent inside the Claude desktop app.\\nUse \\`file tools\\`.\\nLiteral: \\\\n and \\${text}. \\u2192 \\u{1F600}\\n</application_details>`;',
+      "module.exports = t;",
+    ].join("\n"));
+    assert.equal(
+      loadCoworkSystemPrompt(dir),
+      [
+        "<application_details>",
+        "Claude is operating as an agent inside the Claude desktop app.",
+        "Use `file tools`.",
+        "Literal: \\n and ${text}. → 😀",
+        "</application_details>",
+      ].join("\n"),
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadCoworkSystemPrompt returns an empty string when the prompt is unavailable", () => {
+  assert.equal(loadCoworkSystemPrompt(""), "");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-app-"));
+  try {
+    assert.equal(loadCoworkSystemPrompt(dir), "");
+    fs.writeFileSync(path.join(dir, "app.asar"), "no prompt here");
+    assert.equal(loadCoworkSystemPrompt(dir), "");
+    const prefix = '`<application_details>\\nClaude is operating as an agent inside the Claude desktop app.';
+    for (const tail of ["unfinished", "${dynamic}`", "x".repeat(256 * 1024) + "`"]) {
+      fs.writeFileSync(path.join(dir, "app.asar"), prefix + tail);
+      assert.equal(loadCoworkSystemPrompt(dir), "");
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("unpacked ion-dist directory is served when the Claude build ships no ASAR", async () => {
   // 部分 Claude 版本把前端解包成 resources/ion-dist/，没有 ion-dist.asar（issue #5）。
   const resourcesDir = path.join(root, "unpacked-resources");
@@ -581,6 +621,7 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
   fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
   fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
+    system_prompts: { other_prompt: { on: false } },
     org_growthbook: {
       hashing_algorithm: "djb2",
       features: {
@@ -600,12 +641,18 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   const features = async (extra) => {
     const instance = await start({ ...env, ...extra }, runtimeDir);
     try {
-      return (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+      const bootstrap = (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+      const prompts = await request(instance, "/api/bootstrap/local/system_prompts", { host: "claude.ai" });
+      assert.equal(prompts.status, 200);
+      assert.deepEqual(prompts.json, bootstrap.system_prompts);
+      return bootstrap;
     } finally {
       await stop(instance);
     }
   };
   const on = await features({});
+  assert.deepEqual(on.system_prompts.other_prompt, { on: false });
+  assert.ok(on.system_prompts.cowork_system_prompt.value.prompt.length > 0);
   assert.deepEqual(on.org_growthbook.features["574905726"], { defaultValue: true });
   assert.deepEqual(on.org_growthbook.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
   assert.equal(on.org_growthbook.hashing_algorithm, "djb2");
@@ -613,6 +660,7 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   assert.deepEqual(on.org_growthbook.features["2436273311"], { defaultValue: false });
   assert.deepEqual(Object.keys(on.gated_imports), ["cardinal"]);
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
+  assert.deepEqual(off.system_prompts, { other_prompt: { on: false } });
   assert.deepEqual(off.org_growthbook.features["574905726"], { defaultValue: false });
   assert.deepEqual(off.org_growthbook.features["2436273311"], { defaultValue: false }, "主页样式和 Cowork 开关互不相干");
   // 设置里选了合并式主页：两处都按模板原样。
