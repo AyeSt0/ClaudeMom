@@ -1570,7 +1570,7 @@ function mockApi(req, res, url) {
   }
   // 插件目录页校验 {data:[...]}；通用 {} 会触发 RegistryFetchError: expected array。
   if (method === "GET" && (p === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(p))) {
-    return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+    return json(res, EMPTY_PLUGIN_DIRECTORY);
   }
   if (method === "GET" && /\/dxt\/(?:extensions|installable_extensions)$/.test(p)) {
     return json(res, { entries: [], total: 0 });
@@ -2021,6 +2021,39 @@ function proxyUpstream(req, res, url) {
   req.pipe(upstreamReq);
 }
 
+const EMPTY_PLUGIN_DIRECTORY = { data: [], next_page: null, facets: {}, omitted: [] };
+
+// api.anthropic.com 的插件目录是公开接口（不用登录），插件页从 claude.ai 跨域读它：转给真接口。
+// 连不上或被拒时回空目录。响应必须带 CORS 头：缺了页面读不到，整页报「无法加载插件」（#25）。
+function publicPluginDirectory(req, res, url) {
+  const cors = { "access-control-allow-origin": "*" };
+  const empty = () => json(res, EMPTY_PLUGIN_DIRECTORY, 200, cors);
+  const target = new URL(url.pathname + url.search, UPSTREAM_MAP[url.host] || `https://${url.host}`);
+  const upstreamReq = upstreamRequest(
+    target,
+    {
+      hostname: target.hostname,
+      port: target.port || 443,
+      path: target.pathname + target.search,
+      headers: { host: url.host, accept: "application/json" },
+      timeout: 20000,
+    },
+    (up) => {
+      if (up.statusCode !== 200) {
+        up.resume();
+        return empty();
+      }
+      res.writeHead(200, { ...streamedResponseHeaders(up.headers), ...cors });
+      up.pipe(res);
+      res.on("close", () => { if (!up.complete) upstreamReq.destroy(); });
+      up.on("close", () => { if (!up.complete) res.destroy(); });
+    },
+  );
+  upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("upstream timeout")));
+  upstreamReq.on("error", () => (res.headersSent ? res.destroy() : empty()));
+  upstreamReq.end();
+}
+
 // ── 请求处理 ─────────────────────────────────────────────────
 const demoHtml = MODE === "demo" ? fs.readFileSync(path.join(here, "demo", "index.html")) : null;
 
@@ -2239,8 +2272,11 @@ function handle(req, res, hostHeader) {
           organization: { uuid: ORG.uuid, name: ORG.name },
         });
       }
-      if (url.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(url.pathname)) {
-        return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+      if (req.method === "GET" && url.pathname === "/api/directory/plugins") {
+        return publicPluginDirectory(req, res, url);
+      }
+      if (/^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(url.pathname)) {
+        return json(res, EMPTY_PLUGIN_DIRECTORY);
       }
       if (/\/dxt\/(?:extensions|installable_extensions)$/.test(url.pathname)) {
         return json(res, { entries: [], total: 0 });
@@ -2665,7 +2701,7 @@ const outer = http.createServer((req, res) => {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
   }
   if (u.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(u.pathname)) {
-    return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+    return json(res, EMPTY_PLUGIN_DIRECTORY);
   }
   if (/\/dxt\/(?:extensions|installable_extensions)$/.test(u.pathname)) {
     return json(res, { entries: [], total: 0 });

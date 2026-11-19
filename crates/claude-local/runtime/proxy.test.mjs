@@ -360,6 +360,15 @@ before(async () => {
       });
       return res.end(cdnAssetBody);
     }
+    if (req.url.startsWith("/api/directory/plugins")) {
+      if (req.url.includes("refuse=1")) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "region" }));
+      }
+      // 真接口自己带 CORS 头；这里故意不带，代理必须补上。
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ data: [{ id: "plugin_fixture" }], next_page: null, facets: {}, omitted: [] }));
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, host: req.headers.host, url: req.url }));
   });
@@ -376,6 +385,7 @@ before(async () => {
       CLAUDE_LOCAL_UPSTREAM_MAP: JSON.stringify({
         "downloads.claude.ai": `http://127.0.0.1:${upstreamFixturePort}`,
         "assets-proxy.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
+        "api.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
       }),
       CLAUDE_LOCAL_CACHE_DIR: dictationCacheDir,
       CLAUDE_LOCAL_COWORK_PROMPT_FILE: coworkPromptFile,
@@ -904,7 +914,10 @@ for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
 
 for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
   test(`plugin directory returns an array page over ${host || "direct HTTP"}`, async () => {
-    for (const pathname of ["/api/directory/plugins", "/api/organizations/local/directory/plugins"]) {
+    // api.anthropic.com 上的公开目录转给真接口，另有用例。
+    const paths = ["/api/organizations/local/directory/plugins"];
+    if (host !== "api.anthropic.com") paths.push("/api/directory/plugins");
+    for (const pathname of paths) {
       const result = await request(pathname, { host });
       assert.equal(result.status, 200);
       assert.deepEqual(result.body.data, []);
@@ -914,6 +927,23 @@ for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
     }
   });
 }
+
+test("the public plugin directory comes from Anthropic and is readable cross-origin from claude.ai", async () => {
+  const before = upstreamRequests.length;
+  const listed = await request("/api/directory/plugins?limit=24&order_by=trending", { host: "api.anthropic.com" });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.body.data, [{ id: "plugin_fixture" }]);
+  assert.equal(listed.headers["access-control-allow-origin"], "*");
+  assert.deepEqual(upstreamRequests.slice(before), [
+    { host: "api.anthropic.com", url: "/api/directory/plugins?limit=24&order_by=trending" },
+  ]);
+
+  // 真接口拒绝（地区限制等）时回空目录，同样要带 CORS 头：缺了页面读不到，整页报「无法加载插件」。
+  const refused = await request("/api/directory/plugins?refuse=1", { host: "api.anthropic.com" });
+  assert.equal(refused.status, 200);
+  assert.deepEqual(refused.body, { data: [], next_page: null, facets: {}, omitted: [] });
+  assert.equal(refused.headers["access-control-allow-origin"], "*");
+});
 
 for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
   test(`DXT extension lists return entries and total over ${host || "direct HTTP"}`, async () => {
