@@ -1079,6 +1079,23 @@ test("REST completions show the upstream's error in the reply and end the stream
   assert.equal(service.output().includes("invalid x-api-key"), false, "受管模式不把上游错误细节写进日志");
 });
 
+test("REST chats reopen with the last selected model and use it for the next reply", async () => {
+  const base = `/api/organizations/local/chat_conversations/${crypto.randomUUID()}`;
+  const host = "claude.ai";
+  await request(service, `${base}/completion`, { host, body: { prompt: "first turn" } });
+  assert.equal(received.at(-1).body.model, modelIds[0]);
+  await request(service, `${base}/completion`, { host, body: { prompt: "switch model", model: modelIds[2] } });
+  assert.equal(received.at(-1).body.model, modelIds[2]);
+
+  await stop(service);
+  service = await start();
+  const detail = (await request(service, base, { host })).json;
+  assert.equal(detail.model, modelIds[2]);
+  assert.equal(detail.chat_messages.length, 4);
+  await request(service, `${base}/completion`, { host, body: { prompt: "continue" } });
+  assert.equal(received.at(-1).body.model, modelIds[2]);
+});
+
 test("REST completions accept compressed request bodies and conversations can be renamed and deleted", async () => {
   const conv = crypto.randomUUID();
   const base = `/api/organizations/local/chat_conversations/${conv}`;

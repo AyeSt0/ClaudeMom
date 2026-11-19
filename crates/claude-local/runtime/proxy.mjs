@@ -1457,7 +1457,13 @@ function mockApi(req, res, url) {
         || "";
       const human = body.turn_message_uuids?.human_message_uuid || crypto.randomUUID();
       const asst = body.turn_message_uuids?.assistant_message_uuid || crypto.randomUUID();
-      const model = gatewayModel(runtime, body.model || process.env.GATEWAY_MODEL);
+      const convUuid = (p.match(/\/chat_conversations\/([0-9a-f-]{36})\/completion/) || [])[1];
+      const conv = convUuid ? ensureConv(convUuid) : null;
+      const model = gatewayModel(runtime, body.model || conv?.model || process.env.GATEWAY_MODEL);
+      if (conv && conv.model !== model) {
+        conv.model = model;
+        stateStore.changed();
+      }
       const sendEv = (ev, obj) => {
         res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`);
       };
@@ -1471,8 +1477,6 @@ function mockApi(req, res, url) {
         message: { uuid: asst, parent_uuid: human, model: body.model || model, role: "assistant", content: [] },
       });
       sendEv("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-      const convUuid = (p.match(/\/chat_conversations\/([0-9a-f-]{36})\/completion/) || [])[1];
-      const conv = convUuid ? ensureConv(convUuid) : null;
       if (conv && !conv.chat_messages.some((m) => m.uuid === human)) {
         pushMessage(conv, { uuid: human, sender: "human", text: prompt });
         if ((!conv.name || conv.name === "New conversation") && prompt.trim()) {
