@@ -1872,6 +1872,33 @@ function upstreamRequest(target, options, callback) {
   return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
 }
 
+/**
+ * 上游失败时兜底响应的头部。
+ *
+ * 响应体是本代理自己生成的，跨域调用方（页面里的统计上报、CDN 以外的资源域名等）必须能读到状态和
+ * 原因。以前这里只给了 content-type，前端只能看到「No 'Access-Control-Allow-Origin' header」，
+ * 上游不可用被误报成 CORS 问题——实测一次启动能刷出 900 多条这种报错，界面直接进错误边界。
+ *
+ * 带 Origin 时回显它（并允许凭据：通配值在凭据请求里会被浏览器直接拒掉），没带 Origin 的调用方给
+ * 通配值，和静态资源那几条本地响应保持一致。
+ */
+function upstreamFailureHeaders(req) {
+  const result = {
+    "content-type": "text/plain; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  };
+  const origin = typeof req.headers.origin === "string" ? req.headers.origin.trim() : "";
+  if (origin && !origin.includes(",")) {
+    result["access-control-allow-origin"] = origin;
+    result["access-control-allow-credentials"] = "true";
+    result["vary"] = "origin";
+  } else {
+    result["access-control-allow-origin"] = "*";
+  }
+  return result;
+}
+
 function proxyUpstream(req, res, url) {
   const cacheKey = `${url.host}${url.pathname}${url.search}`;
   const cp = cachePathFor(cacheKey);
@@ -1949,7 +1976,7 @@ function proxyUpstream(req, res, url) {
       const docStub = isDocNav(req, url) && (meta.status !== 200 || body.length < 4096);
       if (docStub) {
         // 桩体不落回客户端；真外壳兜底已在上层分支兜底
-        res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+        res.writeHead(502, upstreamFailureHeaders(req));
         res.end("upstream unavailable (doc stub suppressed)\n");
         return;
       }
@@ -1959,7 +1986,7 @@ function proxyUpstream(req, res, url) {
       return;
     }
     log(`UPSTREAM FAIL ${url.pathname}: ${err.message}`);
-    res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+    res.writeHead(502, upstreamFailureHeaders(req));
     res.end(`upstream unavailable: ${err.message}\n`);
   });
   req.pipe(upstreamReq);
