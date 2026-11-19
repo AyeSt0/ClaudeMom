@@ -178,7 +178,7 @@ before(async () => {
     "audio/tone.mp3": Buffer.from([0x49, 0x44, 0x33]),
   });
   fs.mkdirSync(path.join(root, "runtime", "scripts"), { recursive: true });
-  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "scripts/patch-dictation-start.mjs"]) {
+  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "plugins.mjs", "scripts/patch-dictation-start.mjs"]) {
     fs.copyFileSync(path.join(here, file), path.join(root, "runtime", file));
   }
   fs.copyFileSync(
@@ -1079,6 +1079,23 @@ test("REST completions show the upstream's error in the reply and end the stream
   assert.equal(service.output().includes("invalid x-api-key"), false, "受管模式不把上游错误细节写进日志");
 });
 
+test("REST chats reopen with the last selected model and use it for the next reply", async () => {
+  const base = `/api/organizations/local/chat_conversations/${crypto.randomUUID()}`;
+  const host = "claude.ai";
+  await request(service, `${base}/completion`, { host, body: { prompt: "first turn" } });
+  assert.equal(received.at(-1).body.model, modelIds[0]);
+  await request(service, `${base}/completion`, { host, body: { prompt: "switch model", model: modelIds[2] } });
+  assert.equal(received.at(-1).body.model, modelIds[2]);
+
+  await stop(service);
+  service = await start();
+  const detail = (await request(service, base, { host })).json;
+  assert.equal(detail.model, modelIds[2]);
+  assert.equal(detail.chat_messages.length, 4);
+  await request(service, `${base}/completion`, { host, body: { prompt: "continue" } });
+  assert.equal(received.at(-1).body.model, modelIds[2]);
+});
+
 test("REST completions accept compressed request bodies and conversations can be renamed and deleted", async () => {
   const conv = crypto.randomUUID();
   const base = `/api/organizations/local/chat_conversations/${conv}`;
@@ -1182,6 +1199,31 @@ test("state loader validates contracts, preserves corrupt files and settles inte
   createStateStore(path.join(root, "interrupted.json"), conversations, new Map());
   assert.equal(conversations.values().next().value.turns[0].stopReason, "interrupted");
   assert.equal(conversations.values().next().value.turns[0].complete, true);
+});
+
+test("installed plugins survive a restart and state without them still loads", () => {
+  const file = path.join(root, "plugins-state.json");
+  const plugin = {
+    id: "plugin_fixture01", manifest_name: "demo-manifest",
+    source: { type: "directory", repository: { url: "https://github.com/acme/tools", reviewed_commit: "0".repeat(40) } },
+  };
+  createStateStore(file, new Map(), new Map(), undefined, new Map([[plugin.id, plugin]])).flush();
+  const restored = new Map();
+  createStateStore(file, new Map(), new Map(), undefined, restored);
+  assert.deepEqual([...restored], [[plugin.id, plugin]]);
+
+  // 0.1.9 及以前的状态文件没有 plugins。
+  const legacy = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete legacy.plugins;
+  fs.writeFileSync(file, JSON.stringify(legacy));
+  const warnings = [];
+  createStateStore(file, new Map(), new Map(), (message) => warnings.push(message), new Map());
+  assert.deepEqual(warnings, []);
+
+  // 记录里没有能下载的源码位置：整份状态按损坏处理，不带着装不了的插件跑。
+  fs.writeFileSync(file, JSON.stringify({ ...legacy, plugins: [{ id: "plugin_fixture01", manifest_name: "demo-manifest" }] }));
+  createStateStore(file, new Map(), new Map(), (message) => warnings.push(message), new Map());
+  assert.equal(warnings.length, 1);
 });
 
 test("gateway contracts keep duplicate model names distinct and old sessions use the default", () => {

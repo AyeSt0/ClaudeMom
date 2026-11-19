@@ -29,6 +29,7 @@ import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
 import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
+import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const runtime = runtimeConfig();
@@ -495,11 +496,12 @@ function noteClient() {
 
 const CONV_STATE = new Map();
 const NOTIFICATION_SETTINGS = new Map();
+const INSTALLED_PLUGINS = new Map(); // 插件 id → 安装时的目录记录
 let DEVICE_ROW = null; // Code 模式注册的设备行 {id, k, ...}
 const stateStore = createStateStore(STATE_FILE, CONV_STATE, NOTIFICATION_SETTINGS, (warning) => {
   persistenceWarning = warning;
   console.error(warning);
-});
+}, INSTALLED_PLUGINS);
 
 function ensureConv(uuid) {
   if (!CONV_STATE.has(uuid)) {
@@ -1095,6 +1097,10 @@ function mockApi(req, res, url) {
         value: runtime.computerUse, on: runtime.computerUse, off: !runtime.computerUse, source: "force",
         experiment: null, experimentResult: null,
       },
+      // 账号插件的同步：关着时桌面端不读已装列表、不下载插件、会话里也不挂载（见 pluginApi）。
+      "2340532315": {
+        value: true, on: true, off: false, source: "force", experiment: null, experimentResult: null,
+      },
     };
     // 后台模式的 macOS 版本上限（Claude 内置默认 26.x，系统更新就提示「暂不支持」）。
     // 强制开启时把上限抬到 99，新系统也放行。
@@ -1175,15 +1181,11 @@ function mockApi(req, res, url) {
   }
 
   // 插件安装状态核对：客户端要求 `checked` 数组；通用 library 分页结构会触发加载错误。
+  // 空数组表示都还在，桌面端不会删本地已装的插件。
   if (method === "POST" && /^\/api\/organizations\/[^/]+\/library\/plugins\/installed_check$/.test(p)) {
     return json(res, { checked: [] });
   }
-  // 本地 mock 没有官方插件元数据或下载包；返回 API 能识别的 not-found，而不是 200 + {}，
-  // 这样详情页能处理明确的缺失状态，不会把空对象当成功插件数据渲染。
-  if (method === "GET" && /^\/api\/organizations\/[^/]+\/plugins\/(?:by-name\/[^/]+|[^/]+)$/.test(p) &&
-      !/\/plugins\/(?:list-plugins|registry)$/.test(p)) {
-    return json(res, { error: { details: { error_code: "plugin_not_found" } } }, 404);
-  }
+  if (pluginApi(req, res, url, p)) return;
 
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
@@ -1195,9 +1197,6 @@ function mockApi(req, res, url) {
   if (/\/library(\/|$)/.test(p)) return json(res, pageShape);
   if (/\/projects\/count$/.test(p)) return json(res, { count: 0 });
   if (/\/projects(_v2)?$/.test(p)) return json(res, pageShape);
-  if (/\/plugins\/list-plugins$/.test(p)) {
-    return json(res, { plugins: [], installed_plugin_ids: [] });
-  }
   // Code 模式 OAuth：刷新 token（被通用 /v1/ 兜底吃掉会导致 stale_relogin 常驻）
   if (p === "/v1/oauth/token" && req.method === "POST") {
     return json(res, {
@@ -1457,7 +1456,13 @@ function mockApi(req, res, url) {
         || "";
       const human = body.turn_message_uuids?.human_message_uuid || crypto.randomUUID();
       const asst = body.turn_message_uuids?.assistant_message_uuid || crypto.randomUUID();
-      const model = gatewayModel(runtime, body.model || process.env.GATEWAY_MODEL);
+      const convUuid = (p.match(/\/chat_conversations\/([0-9a-f-]{36})\/completion/) || [])[1];
+      const conv = convUuid ? ensureConv(convUuid) : null;
+      const model = gatewayModel(runtime, body.model || conv?.model || process.env.GATEWAY_MODEL);
+      if (conv && conv.model !== model) {
+        conv.model = model;
+        stateStore.changed();
+      }
       const sendEv = (ev, obj) => {
         res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`);
       };
@@ -1471,8 +1476,6 @@ function mockApi(req, res, url) {
         message: { uuid: asst, parent_uuid: human, model: body.model || model, role: "assistant", content: [] },
       });
       sendEv("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-      const convUuid = (p.match(/\/chat_conversations\/([0-9a-f-]{36})\/completion/) || [])[1];
-      const conv = convUuid ? ensureConv(convUuid) : null;
       if (conv && !conv.chat_messages.some((m) => m.uuid === human)) {
         pushMessage(conv, { uuid: human, sender: "human", text: prompt });
         if ((!conv.name || conv.name === "New conversation") && prompt.trim()) {
@@ -1566,7 +1569,7 @@ function mockApi(req, res, url) {
   }
   // 插件目录页校验 {data:[...]}；通用 {} 会触发 RegistryFetchError: expected array。
   if (method === "GET" && (p === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(p))) {
-    return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+    return json(res, EMPTY_PLUGIN_DIRECTORY);
   }
   if (method === "GET" && /\/dxt\/(?:extensions|installable_extensions)$/.test(p)) {
     return json(res, { entries: [], total: 0 });
@@ -2017,6 +2020,219 @@ function proxyUpstream(req, res, url) {
   req.pipe(upstreamReq);
 }
 
+const EMPTY_PLUGIN_DIRECTORY = { data: [], next_page: null, facets: {}, omitted: [] };
+
+// api.anthropic.com 的插件目录是公开接口（不用登录），插件页从 claude.ai 跨域读它：转给真接口。
+// 连不上或被拒时回空目录。响应必须带 CORS 头：缺了页面读不到，整页报「无法加载插件」（#25）。
+function publicPluginDirectory(req, res, url) {
+  const cors = { "access-control-allow-origin": "*" };
+  const empty = () => json(res, EMPTY_PLUGIN_DIRECTORY, 200, cors);
+  const target = new URL(url.pathname + url.search, UPSTREAM_MAP[url.host] || `https://${url.host}`);
+  const upstreamReq = upstreamRequest(
+    target,
+    {
+      hostname: target.hostname,
+      port: target.port || 443,
+      path: target.pathname + target.search,
+      headers: { host: url.host, accept: "application/json" },
+      timeout: 20000,
+    },
+    (up) => {
+      if (up.statusCode !== 200) {
+        up.resume();
+        return empty();
+      }
+      res.writeHead(200, { ...streamedResponseHeaders(up.headers), ...cors });
+      up.pipe(res);
+      res.on("close", () => { if (!up.complete) upstreamReq.destroy(); });
+      up.on("close", () => { if (!up.complete) res.destroy(); });
+    },
+  );
+  upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("upstream timeout")));
+  upstreamReq.on("error", () => (res.headersSent ? res.destroy() : empty()));
+  upstreamReq.end();
+}
+
+/** 读完一个上游地址的整个响应体，超过 `limit` 字节就放弃。 */
+function fetchUpstream(address, limit) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(address);
+    const target = new URL(url.pathname + url.search, UPSTREAM_MAP[url.host] || url.origin);
+    const request = upstreamRequest(
+      target,
+      {
+        hostname: target.hostname,
+        port: target.port || 443,
+        path: target.pathname + target.search,
+        headers: { host: url.host, accept: "*/*", "user-agent": "claude-local" },
+        timeout: 30000,
+      },
+      (response) => {
+        const chunks = [];
+        let size = 0;
+        response.on("data", (chunk) => {
+          size += chunk.length;
+          if (size > limit) return request.destroy(new Error("upstream response too large"));
+          chunks.push(chunk);
+        });
+        response.on("end", () => resolve({ status: response.statusCode, body: Buffer.concat(chunks) }));
+        response.on("error", reject);
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error("upstream timeout")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+const PLUGIN_DIRECTORY_URL = "https://api.anthropic.com/api/directory/plugins";
+const PLUGIN_LOOKUP_TTL_MS = 10 * 60_000;
+// 桌面端自己的上限是解压后 200 MB。
+const MAX_PLUGIN_ZIP_BYTES = 256 * 1024 * 1024;
+const pluginLookups = new Map();
+
+/** 到公开目录查一个插件：能装的返回目录记录，查不到或装不了（没有源码仓库）返回 null。目录连不上时抛错。 */
+async function directoryPlugin(key, address) {
+  const cached = pluginLookups.get(key);
+  if (cached && Date.now() - cached.at < PLUGIN_LOOKUP_TTL_MS) return cached.entry;
+  const { status, body } = await fetchUpstream(address, 4 * 1024 * 1024);
+  if (status !== 200 && status !== 404) throw new Error(`plugin directory answered ${status}`);
+  let entry = null;
+  if (status === 200) {
+    const parsed = JSON.parse(body.toString("utf8"));
+    const row = Array.isArray(parsed?.data) ? parsed.data[0] : parsed;
+    if (installablePlugin(row)) entry = row;
+  }
+  if (pluginLookups.size >= 500) pluginLookups.clear();
+  pluginLookups.set(key, { at: Date.now(), entry });
+  return entry;
+}
+
+// id 和名字都要拼进目录的地址和过滤表达式，格式不对的直接当查不到。
+function directoryPluginById(id) {
+  if (!/^plugin_\w{1,64}$/.test(id)) return null;
+  return directoryPlugin(`id:${id}`, `${PLUGIN_DIRECTORY_URL}/${id}`);
+}
+
+function directoryPluginByName(name) {
+  if (!/^[\w.-]{1,128}$/.test(name)) return null;
+  const filter = `manifest_name == '${name}' && source.marketplace_slug == '${DIRECTORY_MARKETPLACE.name}'`;
+  return directoryPlugin(`name:${name}`, `${PLUGIN_DIRECTORY_URL}?limit=1&filter=${encodeURIComponent(filter)}`);
+}
+
+/**
+ * 账号侧的插件接口（详情、已装列表、启用状态、安装包）。处理了返回 true。
+ *
+ * 安装的过程：网页 PUT `plugins/<id>/enabled`，然后让桌面端同步；桌面端读「已启用的插件」列表，
+ * 对本地没有的逐个 GET `plugins/<id>/download` 取 zip 解压，之后的 Cowork / Code 会话里就有这个插件。
+ * 卸载是 PUT enabled=false，桌面端删掉本地那份。
+ */
+function pluginApi(req, res, url, p) {
+  const route = /^\/api\/organizations\/[^/]+\/(.+)$/.exec(p)?.[1];
+  if (!route) return false;
+  const method = req.method;
+  const notFound = () => json(res, { error: { details: { error_code: "plugin_not_found" } } }, 404);
+  const answer = (work) => {
+    work().catch(() => {
+      if (res.headersSent) return res.destroy();
+      json(res, { type: "error", error: { type: "api_error", message: "Plugin directory unavailable" } }, 502);
+    });
+    return true;
+  };
+  const installed = () => [...INSTALLED_PLUGINS.values()];
+
+  if (method === "GET" && route === "marketplaces/list-default-marketplaces") {
+    json(res, { marketplaces: [DIRECTORY_MARKETPLACE] });
+    return true;
+  }
+  // 市场自己的插件清单：浏览用的是公开目录，这里不重复列。
+  if (method === "GET" && /^marketplaces\/[^/]+\/plugins\/(?:account-)?list-plugins$/.test(route)) {
+    json(res, { plugins: [], has_more: false });
+    return true;
+  }
+  if (method === "GET" && route === "plugins/list-plugins") {
+    // 桌面端分三种查：组织强制安装的、账号启用的（enabled_only）、可浏览的。只有第二种有内容。
+    const enabledOnly = url.searchParams.get("enabled_only") === "true";
+    json(res, { plugins: enabledOnly ? installed().map((entry) => pluginRecord(entry, true)) : [], has_more: false });
+    return true;
+  }
+  // 「您的插件」：只接按种类查插件的那种读法，其余（skill、分组）留给通用的空列表。
+  if (method === "GET" && route === "library/mine" && url.searchParams.get("kind") === "plugin" &&
+      !url.searchParams.has("group_by_kind")) {
+    json(res, { items: installed().map(libraryItem), next_cursor: null });
+    return true;
+  }
+  // 合并式插件页的「您的插件」读的是组织目录里状态为已启用 / 已停用的记录。
+  if (method === "GET" && route === "directory/plugins" &&
+      /installation\.state in \[[^\]]*'enabled'/.test(url.searchParams.get("filter") ?? "")) {
+    json(res, { ...EMPTY_PLUGIN_DIRECTORY, data: installed().map(installedDirectoryRecord) });
+    return true;
+  }
+  if (method === "GET" && route === "plugins/enabled-state") {
+    json(res, {
+      preferences: installed().map((entry) => ({
+        plugin_name: entry.manifest_name,
+        marketplace_id: DIRECTORY_MARKETPLACE.id,
+        marketplace_name: DIRECTORY_MARKETPLACE.name,
+        enabled: true,
+      })),
+    });
+    return true;
+  }
+
+  const byName = /^plugins\/by-name\/([^/]+)$/.exec(route);
+  if (method === "GET" && byName) {
+    return answer(async () => {
+      let name = "";
+      try { name = decodeURIComponent(byName[1]); } catch {}
+      const marketplace = url.searchParams.get("marketplace_name");
+      const entry = marketplace && marketplace !== DIRECTORY_MARKETPLACE.name
+        ? null
+        : installed().find((plugin) => plugin.manifest_name === name) ?? await directoryPluginByName(name);
+      if (!entry) return notFound();
+      json(res, pluginRecord(entry, INSTALLED_PLUGINS.has(entry.id)));
+    });
+  }
+
+  const plugin = /^plugins\/([^/]+)(?:\/(scan-status|versions|download|enabled))?$/.exec(route);
+  if (!plugin || plugin[1] === "registry") return false;
+  const [, id, action] = plugin;
+
+  if (method === "PUT" && action === "enabled") {
+    readBody(req, (raw) => answer(async () => {
+      const enabled = decodeJsonBody(req, raw).enabled !== false;
+      // 启用时重新查一次目录：重装就能拿到新审核的提交。目录连不上时沿用已装的那份。
+      const entry = (enabled ? await Promise.resolve(directoryPluginById(id)).catch(() => null) : null)
+        ?? INSTALLED_PLUGINS.get(id) ?? await directoryPluginById(id);
+      if (!entry) return notFound();
+      if (enabled) INSTALLED_PLUGINS.set(id, entry);
+      else INSTALLED_PLUGINS.delete(id);
+      stateStore.flush();
+      json(res, pluginRecord(entry, enabled));
+    }));
+    return true;
+  }
+  if (method !== "GET") return false;
+  if (action === "versions") {
+    // 版本历史没有数据来源；404 在前端表示「不支持」，页面照常显示。
+    notFound();
+    return true;
+  }
+  return answer(async () => {
+    const entry = INSTALLED_PLUGINS.get(id) ?? await directoryPluginById(id);
+    if (!entry) return notFound();
+    if (action === "scan-status") return json(res, { content_scan: null });
+    if (action !== "download") return json(res, pluginRecord(entry, INSTALLED_PLUGINS.has(id)));
+    const { owner, repo, commit, dir } = pluginRepository(entry);
+    const source = await fetchUpstream(`https://codeload.github.com/${owner}/${repo}/zip/${commit}`, MAX_PLUGIN_ZIP_BYTES);
+    if (source.status !== 200) throw new Error(`plugin source answered ${source.status}`);
+    // 桌面端解压时会去掉唯一的最外层目录，整个仓库就是插件时原样给。
+    const zip = dir ? zipSubtree(source.body, dir) : source.body;
+    res.writeHead(200, { "content-type": "application/zip", "content-length": zip.length, "cache-control": "no-store" });
+    res.end(zip);
+  });
+}
+
 // ── 请求处理 ─────────────────────────────────────────────────
 const demoHtml = MODE === "demo" ? fs.readFileSync(path.join(here, "demo", "index.html")) : null;
 
@@ -2235,8 +2451,11 @@ function handle(req, res, hostHeader) {
           organization: { uuid: ORG.uuid, name: ORG.name },
         });
       }
-      if (url.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(url.pathname)) {
-        return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+      if (req.method === "GET" && url.pathname === "/api/directory/plugins") {
+        return publicPluginDirectory(req, res, url);
+      }
+      if (/^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(url.pathname)) {
+        return json(res, EMPTY_PLUGIN_DIRECTORY);
       }
       if (/\/dxt\/(?:extensions|installable_extensions)$/.test(url.pathname)) {
         return json(res, { entries: [], total: 0 });
@@ -2661,7 +2880,7 @@ const outer = http.createServer((req, res) => {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
   }
   if (u.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(u.pathname)) {
-    return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+    return json(res, EMPTY_PLUGIN_DIRECTORY);
   }
   if (/\/dxt\/(?:extensions|installable_extensions)$/.test(u.pathname)) {
     return json(res, { entries: [], total: 0 });
