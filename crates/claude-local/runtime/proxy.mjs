@@ -529,6 +529,7 @@ const conversationService = createConversationService({
   listConvs: () => [...CONV_STATE.values()],
   log,
   onChange: (flush) => flush ? stateStore.flush() : stateStore.changed(),
+  request: (target, options, callback) => upstreamRequest(target, options, callback),
 });
 
 function pushMessage(conv, msg) {
@@ -946,7 +947,8 @@ function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) 
     settled = true;
     callback(title || fallback);
   };
-  const greq = (target.protocol === "https:" ? https : http).request(
+  const greq = upstreamRequest(
+    target,
     {
       hostname: target.hostname,
       port: target.port || (target.protocol === "https:" ? 443 : 80),
@@ -1507,7 +1509,8 @@ function mockApi(req, res, url) {
         })) : [{ role: "user", content: prompt }],
       });
       const target = gatewayTarget(runtime, "/v1/messages");
-      const greq = (target.protocol === "https:" ? https : http).request(
+      const greq = upstreamRequest(
+        target,
         {
           hostname: target.hostname,
           port: target.port || (target.protocol === "https:" ? 443 : 80),
@@ -1771,7 +1774,7 @@ function forwardGateway(req, res, requestPath, raw) {
     "x-api-key": runtime.key, authorization: `Bearer ${runtime.key}`,
   };
   for (const key of ["proxy-connection", "accept-encoding", "connection", "cookie", "transfer-encoding"]) delete headers[key];
-  const up = (target.protocol === "https:" ? https : http).request({
+  const up = upstreamRequest(target, {
     hostname: target.hostname, port: target.port || (target.protocol === "https:" ? 443 : 80),
     path: target.pathname + target.search, method: req.method, headers, timeout: 300000,
   }, (response) => {
@@ -1905,9 +1908,21 @@ class UpstreamTunnelAgent extends https.Agent {
 const directAgent = new https.Agent(UPSTREAM_POOL);
 const tunnelAgent = UPSTREAM_PROXY ? new UpstreamTunnelAgent(UPSTREAM_POOL) : null;
 
-/** 发往上游网页的请求：https 走连接池，配置了出站代理时经代理隧道（本机地址一律直连）。 */
+/** 发往上游网页与远程网关的请求：配置了出站代理时经代理转发（本机地址一律直连）。 */
 function upstreamRequest(target, options, callback) {
-  if (target.protocol !== "https:") return http.request(options, callback);
+  if (target.protocol !== "https:") {
+    if (UPSTREAM_PROXY && !isLoopbackHost(target.hostname)) {
+      return http.request({
+        ...options,
+        host: UPSTREAM_PROXY.hostname,
+        hostname: UPSTREAM_PROXY.hostname,
+        port: Number(UPSTREAM_PROXY.port || 80),
+        path: target.href,
+        headers: { host: target.host, ...options.headers, ...upstreamProxyAuth() },
+      }, callback);
+    }
+    return http.request(options, callback);
+  }
   const viaProxy = tunnelAgent && !isLoopbackHost(target.hostname);
   return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
 }

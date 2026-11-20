@@ -941,6 +941,84 @@ test("gateway forwarding preserves the configured root, authentication and selec
   assert.deepEqual(result.json.data.map((entry) => entry.id), modelIds);
 });
 
+test("remote HTTPS gateway requests route through the configured upstream proxy", async () => {
+  const gatewayCalls = [];
+  const tlsGateway = https.createServer({
+    key: fs.readFileSync(path.join(here, "ca/server.key")),
+    cert: fs.readFileSync(path.join(here, "ca/server.crt")),
+  }, (req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      gatewayCalls.push({ path: req.url, auth: req.headers.authorization, model: parsed.model, stream: Boolean(parsed.stream) });
+      if (parsed.stream) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "via-proxy" } })}\n\n`
+          + `event: message_stop\ndata: {"type":"message_stop"}\n\n`,
+        );
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "msg_proxy", content: [{ type: "text", text: "ok-via-proxy" }] }));
+    });
+  });
+  tlsGateway.listen(0, "127.0.0.1");
+  await once(tlsGateway, "listening");
+
+  const connects = [];
+  const upstreamProxy = http.createServer();
+  upstreamProxy.on("connect", (req, socket, head) => {
+    connects.push(req.url);
+    socket.on("error", () => {});
+    const target = net.connect(tlsGateway.address().port, "127.0.0.1", () => {
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head?.length) target.write(head);
+      target.pipe(socket);
+      socket.pipe(target);
+    });
+    target.on("error", () => socket.destroy());
+    socket.once("close", () => target.destroy());
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+
+  const instance = await start({
+    CLAUDE_LOCAL_GATEWAY_URL: "https://gateway.anthropic.com",
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+    NODE_EXTRA_CA_CERTS: path.join(here, "ca/ca.pem"),
+  });
+  try {
+    // 1. CLI / Desktop forwardGateway (/v1/messages)
+    const forwarded = await request(instance, "/v1/messages", {
+      body: { model: modelIds[0], messages: [{ role: "user", content: "hello" }] },
+    });
+    assert.equal(forwarded.status, 200);
+    assert.equal(forwarded.json.content[0].text, "ok-via-proxy");
+
+    // 2. RPC ConversationService (anthropicStream)
+    const rpc = await request(instance, "/claudeai-rpc/anthropic.bard.api.v1alpha.ConversationService/SendAndSettle", {
+      host: "claude.ai",
+      body: send("b0b0b0b0-b1b1-42c2-83d3-e4e4e4e4e4e4", "hello rpc", modelIds[0]),
+      type: "application/proto",
+    });
+    assert.equal(rpc.status, 200);
+
+    assert.ok(connects.length >= 1, "远程 HTTPS 网关必须经出站代理 CONNECT 隧道");
+    assert.ok(connects.every((target) => target === "gateway.anthropic.com:443"), `unexpected CONNECT targets: ${connects.join(", ")}`);
+    assert.equal(gatewayCalls.length, 2);
+    assert.equal(gatewayCalls[0].auth, "Bearer test-local-gateway-token");
+    assert.equal(gatewayCalls[1].stream, true);
+  } finally {
+    await stop(instance);
+    upstreamProxy.closeAllConnections();
+    upstreamProxy.close();
+    tlsGateway.closeAllConnections();
+    tlsGateway.close();
+  }
+});
+
 test("managed loopback routes reject cross-site and unauthenticated requests before attaching gateway credentials", async () => {
   const before = received.length;
   for (const options of [
