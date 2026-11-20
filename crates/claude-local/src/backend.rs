@@ -87,6 +87,10 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../runtime/plugins.mjs"),
     ),
     (
+        "connectors.mjs",
+        include_bytes!("../runtime/connectors.mjs"),
+    ),
+    (
         "demo/index.html",
         include_bytes!("../runtime/demo/index.html"),
     ),
