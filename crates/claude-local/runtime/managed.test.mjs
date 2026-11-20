@@ -178,7 +178,7 @@ before(async () => {
     "audio/tone.mp3": Buffer.from([0x49, 0x44, 0x33]),
   });
   fs.mkdirSync(path.join(root, "runtime", "scripts"), { recursive: true });
-  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "plugins.mjs", "connectors.mjs", "scripts/patch-dictation-start.mjs"]) {
+  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "extensions.mjs", "plugins.mjs", "connectors.mjs", "scripts/patch-dictation-start.mjs"]) {
     fs.copyFileSync(path.join(here, file), path.join(root, "runtime", file));
   }
   fs.copyFileSync(
@@ -1270,6 +1270,83 @@ test("installed template lists its example skills as disabled so Claude does not
     const download = await request(instance, "/api/organizations/local/skills/download-dot-skill-file?skill_id=morning&entrypoint=local-agent", { host: "claude.ai" });
     assert.equal(download.status, 404);
     assert.equal(download.json.error.type, "not_found_error");
+  } finally {
+    await stop(instance);
+  }
+});
+
+test("enabled extension packages are injected into the page shell and served same-origin", async () => {
+  const resources = path.join(root, "desktop-resources-nonce");
+  writeAsar(resources, {
+    "index.html": '<!doctype html><html data-build-id="fixture-build"><head><meta charset="UTF-8"><script nonce="abc+/=">window.fixtureAppStarted = true;</script></head><body></body></html>',
+  });
+  const writeExtension = (dir, manifest, files = {}) => {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(manifest));
+    for (const [name, body] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+      fs.writeFileSync(path.join(dir, name), body);
+    }
+  };
+  const builtin = path.join(root, "extensions-builtin");
+  const user = path.join(root, "extensions");
+  const state = path.join(root, "extensions.json");
+  writeExtension(path.join(builtin, "pet"), { id: "pet", name: "Pet", version: "1.0.0", scripts: ["pet.js"] }, { "pet.js": "window.pet = 1;" });
+  // 同 id 以内置为准。
+  writeExtension(path.join(user, "pet"), { id: "pet", name: "Fake", version: "9.0.0", scripts: ["pet.js"] }, { "pet.js": "window.fake = 1;" });
+  writeExtension(path.join(user, "theme"), {
+    id: "theme", name: "Theme", version: "0.2.0-beta.1", styles: ["css/theme.css"], scripts: ["a.js", "b.js", "link.js"],
+  }, { "css/theme.css": "body { color: red; }", "a.js": "window.a = 1;", "b.js": "window.b = 1;", "secret.js": "unlisted" });
+  fs.writeFileSync(path.join(root, "outside.js"), "outside");
+  fs.symlinkSync(path.join(root, "outside.js"), path.join(user, "theme", "link.js"));
+  writeExtension(path.join(user, "broken"), { id: "other", name: "Broken", version: "1.0.0", scripts: ["x.js"] }, { "x.js": "bad" });
+  writeExtension(path.join(user, "off"), { id: "off", name: "Off", version: "1.0.0", scripts: ["off.js"] }, { "off.js": "off" });
+  fs.writeFileSync(state, JSON.stringify({ enabled: ["theme", "pet", "broken", "Bad ID", 3] }));
+
+  const shellOf = async (instance) => (await request(instance, "/new", { host: "claude.ai" })).bytes.toString("utf8");
+  const get = (instance, pathname, options = {}) => request(instance, pathname, { host: "claude.ai", ...options });
+  const instance = await start({
+    CLAUDE_LOCAL_DESKTOP_RESOURCES: resources,
+    CLAUDE_LOCAL_BUILTIN_EXTENSIONS_DIR: builtin,
+    CLAUDE_LOCAL_EXTENSIONS_DIR: user,
+    CLAUDE_LOCAL_EXTENSIONS_STATE: state,
+  });
+  try {
+    const html = await shellOf(instance);
+    const n = ' nonce="abc+/="';
+    const tags = `<script src="/__codex_plus/ext/pet/pet.js"${n}></script>` +
+      `<link rel="stylesheet" href="/__codex_plus/ext/theme/css/theme.css"${n}>` +
+      `<script src="/__codex_plus/ext/theme/a.js"${n}></script>` +
+      `<script src="/__codex_plus/ext/theme/b.js"${n}></script>` +
+      `<script src="/__codex_plus/ext/theme/link.js"${n}></script>`;
+    // 按 id 排序、每个扩展先样式后脚本；在本地化 shim 之后、官方脚本之前。清单不合法和没启用的不注入。
+    assert.ok(html.includes(`<script src="/__codex_plus/claude-localization.js"></script>${tags}<script${n}>`), html);
+    assert.equal([...html.matchAll(/__codex_plus\/ext\//g)].length, 5);
+
+    const js = await get(instance, "/__codex_plus/ext/theme/a.js");
+    assert.equal(js.status, 200);
+    assert.equal(js.headers["content-type"], "text/javascript; charset=utf-8");
+    assert.equal(js.headers["cache-control"], "no-store");
+    assert.equal(js.bytes.toString("utf8"), "window.a = 1;");
+    assert.equal((await get(instance, "/__codex_plus/ext/theme/css/theme.css")).headers["content-type"], "text/css; charset=utf-8");
+    assert.equal((await get(instance, "/__codex_plus/ext/pet/pet.js")).bytes.toString("utf8"), "window.pet = 1;");
+    for (const pathname of [
+      "/__codex_plus/ext/theme/secret.js", "/__codex_plus/ext/theme/link.js", "/__codex_plus/ext/theme/manifest.json",
+      "/__codex_plus/ext/theme/..%2f..%2foutside.js", "/__codex_plus/ext/theme/%2e%2e/%2e%2e/outside.js",
+      "/__codex_plus/ext/off/off.js", "/__codex_plus/ext/broken/x.js", "/__codex_plus/ext/theme", "/__codex_plus/ext/",
+    ]) {
+      assert.equal((await get(instance, pathname)).status, 404, pathname);
+    }
+    assert.equal((await get(instance, "/__codex_plus/ext/theme/a.js", { method: "POST", body: {} })).status, 404);
+
+    // 开关和文件都是每次请求现读，不用重启。
+    fs.writeFileSync(path.join(user, "theme", "a.js"), "window.a = 2;");
+    assert.equal((await get(instance, "/__codex_plus/ext/theme/a.js")).bytes.toString("utf8"), "window.a = 2;");
+    fs.writeFileSync(state, JSON.stringify({ enabled: ["pet"] }));
+    assert.doesNotMatch(await shellOf(instance), /__codex_plus\/ext\/theme\//);
+    assert.equal((await get(instance, "/__codex_plus/ext/theme/a.js")).status, 404);
+    fs.writeFileSync(state, "not json");
+    assert.doesNotMatch(await shellOf(instance), /__codex_plus\/ext\//);
   } finally {
     await stop(instance);
   }

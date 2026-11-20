@@ -14,9 +14,9 @@
       {
         "label": "main",
         "title": "ClaudeMom",
-        "width": 860,
+        "width": 920,
         "height": 600,
-        "minWidth": 720,
+        "minWidth": 780,
         "minHeight": 520,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
