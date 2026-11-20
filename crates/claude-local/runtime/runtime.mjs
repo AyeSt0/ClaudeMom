@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { validConnector } from "./connectors.mjs";
@@ -565,6 +566,17 @@ function validateNotifications(entry) {
       isText(feature, 256) && isRecord(channels) && Object.entries(channels).every(([key, value]) =>
         ["enable_push", "enable_email"].includes(key) ? typeof value === "boolean" :
           ["push_source", "email_source"].includes(key) && isText(value, 64))));
+}
+
+/**
+ * 本机和局域网里的地址。出站代理是按「怎么连 claude.ai」选出来的，系统代理的例外名单没带过来：
+ * 局域网里的上游（NAS、另一台机器上的网关）不能绕去代理，代理软件开着全局模式时会连不上。
+ */
+export function isLocalNetworkHost(hostname) {
+  const host = String(hostname).toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".local") || !/[.:]/.test(host)) return true;
+  if (net.isIPv4(host)) return /^(?:10|127)\.|^192\.168\.|^169\.254\.|^172\.(?:1[6-9]|2\d|3[01])\./.test(host);
+  return net.isIPv6(host) && (host === "::1" || /^(?:f[cd]|fe[89ab])/.test(host));
 }
 
 /**

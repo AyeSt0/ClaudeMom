@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
 import { ConnectorError, connectorRecord, createConnectorService } from "./connectors.mjs";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, isLocalNetworkHost, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
 import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
 
@@ -531,6 +531,7 @@ const conversationService = createConversationService({
   listConvs: () => [...CONV_STATE.values()],
   log,
   onChange: (flush) => flush ? stateStore.flush() : stateStore.changed(),
+  request: (target, options, callback) => gatewayRequest(target, options, callback),
 });
 
 function pushMessage(conv, msg) {
@@ -960,7 +961,8 @@ function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) 
     settled = true;
     callback(title || fallback);
   };
-  const greq = (target.protocol === "https:" ? https : http).request(
+  const greq = gatewayRequest(
+    target,
     {
       hostname: target.hostname,
       port: target.port || (target.protocol === "https:" ? 443 : 80),
@@ -1526,7 +1528,8 @@ function mockApi(req, res, url) {
         })) : [{ role: "user", content: prompt }],
       });
       const target = gatewayTarget(runtime, "/v1/messages");
-      const greq = (target.protocol === "https:" ? https : http).request(
+      const greq = gatewayRequest(
+        target,
         {
           hostname: target.hostname,
           port: target.port || (target.protocol === "https:" ? 443 : 80),
@@ -1790,7 +1793,7 @@ function forwardGateway(req, res, requestPath, raw) {
     "x-api-key": runtime.key, authorization: `Bearer ${runtime.key}`,
   };
   for (const key of ["proxy-connection", "accept-encoding", "connection", "cookie", "transfer-encoding"]) delete headers[key];
-  const up = (target.protocol === "https:" ? https : http).request({
+  const up = gatewayRequest(target, {
     hostname: target.hostname, port: target.port || (target.protocol === "https:" ? 443 : 80),
     path: target.pathname + target.search, method: req.method, headers, timeout: 300000,
   }, (response) => {
@@ -1929,6 +1932,30 @@ function upstreamRequest(target, options, callback) {
   if (target.protocol !== "https:") return http.request(options, callback);
   const viaProxy = tunnelAgent && !isLoopbackHost(target.hostname);
   return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
+}
+
+// 模型请求经出站代理时用自己的隧道连接池，不设并发上限：并行的子任务会同时开很多条流，
+// 和网页资源共用每个主机 16 条的池子会排队。
+const gatewayTunnelAgent = UPSTREAM_PROXY ? new UpstreamTunnelAgent({ keepAlive: true }) : null;
+
+/**
+ * 发往模型网关（用户配置的上游）的请求。配置了出站代理、上游又在公网上时经代理走：
+ * 只开系统代理（没开 TUN）时直连会被上游按地区拒绝。其余情况和以前一样直连。
+ */
+function gatewayRequest(target, options, callback) {
+  if (!UPSTREAM_PROXY || isLocalNetworkHost(target.hostname)) {
+    return (target.protocol === "https:" ? https : http).request(options, callback);
+  }
+  if (target.protocol === "https:") return https.request({ ...options, agent: gatewayTunnelAgent }, callback);
+  // 明文 http 的上游：按转发代理的写法，请求行里给完整地址。
+  return http.request({
+    ...options,
+    host: UPSTREAM_PROXY.hostname,
+    hostname: UPSTREAM_PROXY.hostname,
+    port: Number(UPSTREAM_PROXY.port || 80),
+    path: target.href,
+    headers: { host: target.host, ...options.headers, ...upstreamProxyAuth() },
+  }, callback);
 }
 
 function upstreamFailureHeaders(req) {
