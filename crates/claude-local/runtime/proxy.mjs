@@ -2162,11 +2162,38 @@ function pluginApi(req, res, url, p) {
     json(res, { items: installed().map(libraryItem), next_cursor: null });
     return true;
   }
-  // 合并式插件页的「您的插件」读的是组织目录里状态为已启用 / 已停用的记录。
-  if (method === "GET" && route === "directory/plugins" &&
-      /installation\.state in \[[^\]]*'enabled'/.test(url.searchParams.get("filter") ?? "")) {
-    json(res, { ...EMPTY_PLUGIN_DIRECTORY, data: installed().map(installedDirectoryRecord) });
-    return true;
+  // 组织目录：合并式插件页的「您的插件」、搜索、连接器详情页（按 id 查）都读它。
+  if (method === "GET" && route === "directory/plugins") {
+    const filter = url.searchParams.get("filter") ?? "";
+    const wanted = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    // 「您的插件」：状态为已启用 / 已停用的记录，搜索时再按名字筛。
+    if (/^\(?installation\.state in \[/.test(filter)) {
+      const matches = (entry) => !wanted ||
+        [entry.name, entry.slug, entry.summary, entry.publisher?.name].some((text) => String(text ?? "").toLowerCase().includes(wanted));
+      json(res, { ...EMPTY_PLUGIN_DIRECTORY, data: installed().filter(matches).map(installedDirectoryRecord) });
+      return true;
+    }
+    // 其余的查询里只接搜索和按 id 查，原样问公开目录；别的（首页各栏）页面自己会读公开目录，这里留空。
+    if (!wanted && !/^id in \[/.test(filter)) return false;
+    return answer(async () => {
+      // 公开目录不认登录后才有的 include（installation.*），带着会被 400 拒绝。
+      const query = new URLSearchParams(url.searchParams);
+      const include = (query.get("include") ?? "").split(",").filter((part) => part && !part.startsWith("installation"));
+      if (include.length) query.set("include", include.join(","));
+      else query.delete("include");
+      const { status, body } = await fetchUpstream(`${PLUGIN_DIRECTORY_URL}?${query}`, 4 * 1024 * 1024);
+      const page = status === 200 ? JSON.parse(body.toString("utf8")) : EMPTY_PLUGIN_DIRECTORY;
+      // 公开目录里每条都是「未登录」：已装的换成已启用（查询要求没装的时去掉），其余换成未安装。
+      const rows = (Array.isArray(page.data) ? page.data : [])
+        .filter((row) => !(filter.startsWith("!(installation.state in [") && INSTALLED_PLUGINS.has(row?.id)));
+      json(res, {
+        ...page,
+        data: rows.map((row) => (INSTALLED_PLUGINS.has(row?.id) ? installedDirectoryRecord(row) : {
+          ...row,
+          installation: { state: "not_installed", actions: { install: true }, admin_policy: { type: "set", install_mode: "optional" } },
+        })),
+      });
+    });
   }
   if (method === "GET" && route === "plugins/enabled-state") {
     json(res, {
