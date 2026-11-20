@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isLocalNetworkHost, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -1017,6 +1017,46 @@ test("remote HTTPS gateway requests route through the configured upstream proxy"
     tlsGateway.closeAllConnections();
     tlsGateway.close();
   }
+});
+
+test("plain-http remote gateways are asked through the upstream proxy with the full address", async () => {
+  const seen = [];
+  const upstreamProxy = http.createServer((req, res) => {
+    seen.push({ url: req.url, host: req.headers.host, auth: req.headers.authorization });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "msg_plain", content: [{ type: "text", text: "ok-via-forward-proxy" }] }));
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  const instance = await start({
+    CLAUDE_LOCAL_GATEWAY_URL: "http://gateway.example.com",
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+  });
+  try {
+    const forwarded = await request(instance, "/v1/messages", {
+      body: { model: modelIds[0], messages: [{ role: "user", content: "hello" }] },
+    });
+    assert.equal(forwarded.status, 200);
+    assert.equal(forwarded.json.content[0].text, "ok-via-forward-proxy");
+    assert.deepEqual(seen, [{
+      url: "http://gateway.example.com/v1/messages", host: "gateway.example.com", auth: "Bearer test-local-gateway-token",
+    }]);
+  } finally {
+    await stop(instance);
+    upstreamProxy.closeAllConnections();
+    upstreamProxy.close();
+  }
+});
+
+test("gateways on this machine or the local network are never sent to the upstream proxy", () => {
+  // 出站代理是按「怎么连 claude.ai」选的，系统代理的例外名单没带过来：这些地址一律直连。
+  for (const host of [
+    "localhost", "127.0.0.1", "[::1]", "::1", "10.0.0.8", "172.16.3.4", "172.31.255.1", "192.168.1.20", "169.254.10.1",
+    "nas", "gateway.local", "[fd12:3456::1]", "[fe80::1]",
+  ]) assert.equal(isLocalNetworkHost(host), true, host);
+  for (const host of [
+    "api.example.com", "8.8.8.8", "172.32.0.1", "172.15.0.1", "192.169.1.1", "11.0.0.1", "[2001:db8::1]", "local.example.com",
+  ]) assert.equal(isLocalNetworkHost(host), false, host);
 });
 
 test("managed loopback routes reject cross-site and unauthenticated requests before attaching gateway credentials", async () => {
