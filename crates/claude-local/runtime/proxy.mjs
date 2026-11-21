@@ -32,6 +32,7 @@ import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpEr
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
 import { EXTENSION_PREFIX, createExtensions } from "./extensions.mjs";
 import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
+import { createBlobStore, createProjectApi, withProjectContext, withProjectMessages } from "./projects.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const runtime = runtimeConfig();
@@ -529,11 +530,25 @@ const CONV_STATE = new Map();
 const NOTIFICATION_SETTINGS = new Map();
 const INSTALLED_PLUGINS = new Map(); // 插件 id → 安装时的目录记录
 const CONNECTORS = new Map(); // 连接器 uuid → 记录（见 connectors.mjs）
+const PROJECTS = new Map(); // 项目 uuid → 记录（见 projects.mjs）
 let DEVICE_ROW = null; // Code 模式注册的设备行 {id, k, ...}
 const stateStore = createStateStore(STATE_FILE, CONV_STATE, NOTIFICATION_SETTINGS, (warning) => {
   persistenceWarning = warning;
   console.error(warning);
-}, INSTALLED_PLUGINS, CONNECTORS);
+}, INSTALLED_PLUGINS, CONNECTORS, PROJECTS);
+const projectApi = createProjectApi({
+  projects: PROJECTS,
+  // 项目知识的正文和上传的文件放在状态文件旁边，不进状态文件。
+  blobs: createBlobStore(STATE_FILE ? path.join(path.dirname(STATE_FILE), "project-files") : null),
+  account: ACCOUNT,
+  changed: () => stateStore.flush(),
+  conversations: () => [...CONV_STATE.values()],
+  conversationRecord: (conv) => convToRest(conv),
+  removeConversation: (uuid) => CONV_STATE.delete(uuid),
+  json,
+  readBody,
+  decodeJsonBody,
+});
 
 function ensureConv(uuid) {
   if (!CONV_STATE.has(uuid)) {
@@ -562,6 +577,8 @@ const conversationService = createConversationService({
   log,
   onChange: (flush) => flush ? stateStore.flush() : stateStore.changed(),
   request: (target, options, callback) => gatewayRequest(target, options, callback),
+  projectContext: (conv) => projectApi.context(conv.project_uuid),
+  hasProject: (uuid) => projectApi.has(uuid),
 });
 
 function pushMessage(conv, msg) {
@@ -812,6 +829,17 @@ function allowConnectorSignIn(result, template) {
   };
 }
 
+// 项目知识里能传图片：GrowthBook 功能 `project_image`（id 同样是功能名的 hashCode）。录制模板里是 false，
+// 知识面板就只收文档。图片由本地项目接口存下、对话时发给模型（见 projects.mjs）。
+const PROJECT_IMAGE_FEATURE_ID = "3346981045";
+function allowProjectImages(result, template) {
+  if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
+  result.org_growthbook = {
+    ...result.org_growthbook,
+    features: { ...result.org_growthbook.features, [PROJECT_IMAGE_FEATURE_ID]: { defaultValue: true } },
+  };
+}
+
 let resolvedBootstrapCache;
 // 主页问候语里带着称呼：模板里是「Local User」（脱敏时换的），按设置里的用户名换掉。
 const TEMPLATE_DISPLAY_NAME = "Local User";
@@ -846,6 +874,8 @@ function resolvedBootstrap() {
   }
   if (!runtime.hubHome) useClassicHome(result, template);
   allowConnectorSignIn(result, template);
+  allowProjectImages(result, template);
+  result.gated_messages = withProjectMessages(result.gated_messages);
   if (useOfficialShell) {
     // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
     result.gated_imports = {};
@@ -954,12 +984,14 @@ function convToRest(c, { messages = false } = {}) {
   }
   const live = c.turns?.some((t) => !t.complete);
   const title = c.name && c.name !== "New conversation" ? c.name : "";
+  const project = c.project_uuid ? PROJECTS.get(c.project_uuid) : undefined;
   return {
     ...REST_CONV_TEMPLATE,
     // 新版前端会对这些字段直接调用数组/对象操作；录制的 conversations.json 可能为空，
     // 而旧模板字段也可能是 null，因此本地 API 必须保证返回正确形状。
     settings: REST_CONV_TEMPLATE.settings && typeof REST_CONV_TEMPLATE.settings === "object" ? REST_CONV_TEMPLATE.settings : {},
-    project_uuid: REST_CONV_TEMPLATE.project_uuid ?? null,
+    project_uuid: project ? project.uuid : null,
+    ...(project ? { project: { uuid: project.uuid, name: project.name } } : {}),
     is_starred: REST_CONV_TEMPLATE.is_starred ?? false,
     is_archived: REST_CONV_TEMPLATE.is_archived ?? false,
     files: Array.isArray(REST_CONV_TEMPLATE.files) ? REST_CONV_TEMPLATE.files : [],
@@ -1291,6 +1323,7 @@ function mockApi(req, res, url) {
   }
   if (pluginApi(req, res, url, p)) return;
   if (connectorApi(req, res, url, p)) return;
+  if (projectApi.handle(req, res, url, p)) return;
 
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
@@ -1300,10 +1333,6 @@ function mockApi(req, res, url) {
     pagination: { has_more: false, next_cursor: null, cursor: null },
   };
   if (/\/library(\/|$)/.test(p)) return json(res, pageShape);
-  if (/\/projects\/count$/.test(p)) return json(res, { count: 0 });
-  if (/\/projects(_v2)?$/.test(p)) return json(res, pageShape);
-  // 项目页的会话列表按分页校验，{} 会抛 UnreadableProjectConversationsError（#40）。
-  if (/\/projects\/[^/]+\/conversations(_v2)?$/.test(p)) return json(res, pageShape);
   // Code 模式 OAuth：刷新 token（被通用 /v1/ 兜底吃掉会导致 stale_relogin 常驻）
   if (p === "/v1/oauth/token" && req.method === "POST") {
     return json(res, {
@@ -1496,6 +1525,10 @@ function mockApi(req, res, url) {
           ? body.uuid
           : crypto.randomUUID();
         const conv = ensureConv(requestedId);
+        if (projectApi.has(body.project_uuid)) {
+          conv.project_uuid = body.project_uuid;
+          stateStore.flush();
+        }
         if (typeof body.name === "string" && body.name.trim()) {
           conv.name = body.name.trim().slice(0, 200);
           conv.updated_at = now();
@@ -1566,6 +1599,12 @@ function mockApi(req, res, url) {
         conv.model = model;
         stateStore.changed();
       }
+      // 网页版不单独建会话：第一条消息的 create_conversation_params 里带着项目。
+      const projectUuid = body.create_conversation_params?.project_uuid;
+      if (conv && !conv.project_uuid && projectApi.has(projectUuid)) {
+        conv.project_uuid = projectUuid;
+        stateStore.changed();
+      }
       const sendEv = (ev, obj) => {
         res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`);
       };
@@ -1601,14 +1640,14 @@ function mockApi(req, res, url) {
         sendEv("message_stop", { type: "message_stop" });
         res.end();
       };
-      const payload = JSON.stringify({
+      const payload = JSON.stringify(withProjectContext({
         model,
         max_tokens: 4096,
         stream: true,
         messages: conv ? conv.chat_messages.map((message) => ({
           role: message.sender === "human" ? "user" : "assistant", content: message.text,
         })) : [{ role: "user", content: prompt }],
-      });
+      }, projectApi.context(conv?.project_uuid)));
       const target = gatewayTarget(runtime, "/v1/messages");
       const greq = gatewayRequest(
         target,

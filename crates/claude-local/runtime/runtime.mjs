@@ -5,6 +5,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { validConnector } from "./connectors.mjs";
 import { installablePlugin } from "./plugins.mjs";
+import { validProject } from "./projects.mjs";
 
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const MAX_TEXT = 1024 * 1024;
@@ -574,6 +575,7 @@ function validateConversation(conv) {
     isDate(conv.created_at) && isDate(conv.updated_at) &&
     Number.isSafeInteger(conv.nextIndex) && conv.nextIndex >= 0 &&
     (conv.leafMessageId === null || isId(conv.leafMessageId)) &&
+    (conv.project_uuid === undefined || conv.project_uuid === null || isId(conv.project_uuid)) &&
     Array.isArray(conv.turns) && conv.turns.length <= 10000 && conv.turns.every(validateTurn) &&
     Array.isArray(conv.chat_messages) && conv.chat_messages.length <= 20000 &&
     conv.chat_messages.every((message) => isRecord(message) && isId(message.uuid) &&
@@ -612,9 +614,9 @@ export function isLocalNetworkHost(hostname) {
 
 /**
  * `plugins`：装上的插件，id → 安装时那份目录记录。`connectors`：添加的连接器，uuid → 记录（含登录令牌）。
- * 旧状态文件没有这两项。
+ * `projects`：项目，uuid → 记录（知识正文和文件不在这里，见 projects.mjs）。旧状态文件没有这几项。
  */
-export function createStateStore(file, conversations, notifications, warn = () => {}, plugins = new Map(), connectors = new Map()) {
+export function createStateStore(file, conversations, notifications, warn = () => {}, plugins = new Map(), connectors = new Map(), projects = new Map()) {
   let timer;
   let disabled = false;
   if (file && fs.existsSync(file)) {
@@ -628,7 +630,9 @@ export function createStateStore(file, conversations, notifications, warn = () =
         !(state.plugins === undefined || Array.isArray(state.plugins) && state.plugins.length <= 500 &&
           state.plugins.every(installablePlugin)) ||
         !(state.connectors === undefined || Array.isArray(state.connectors) && state.connectors.length <= 500 &&
-          state.connectors.every(validConnector))) throw new Error("Invalid state contract");
+          state.connectors.every(validConnector)) ||
+        !(state.projects === undefined || Array.isArray(state.projects) && state.projects.length <= 2000 &&
+          state.projects.every(validProject))) throw new Error("Invalid state contract");
       for (const conv of state.conversations) {
         // 中断的请求不自动重发，避免重启后重复计费或执行。
         for (const turn of conv.turns) {
@@ -644,6 +648,7 @@ export function createStateStore(file, conversations, notifications, warn = () =
       for (const entry of state.notifications) notifications.set(entry.org, entry.value);
       for (const entry of state.plugins ?? []) plugins.set(entry.id, entry);
       for (const entry of state.connectors ?? []) connectors.set(entry.uuid, entry);
+      for (const entry of state.projects ?? []) projects.set(entry.uuid, entry);
     } catch {
       disabled = true;
       warn("Local conversation state is invalid; the original file was preserved");
@@ -661,6 +666,7 @@ export function createStateStore(file, conversations, notifications, warn = () =
         notifications: [...notifications].map(([org, value]) => ({ org, value })),
         plugins: [...plugins.values()],
         connectors: [...connectors.values()],
+        projects: [...projects.values()],
       }));
       if (body.length > MAX_STATE_BYTES) throw new Error("State exceeds size limit");
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
