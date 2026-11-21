@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
 import { ConnectorError, connectorRecord, createConnectorService } from "./connectors.mjs";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, isLocalNetworkHost, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, isLocalNetworkHost, modelWindow, opencodeSessionHeaders, planProfile, requestSessionId, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
 import { EXTENSION_PREFIX, createExtensions } from "./extensions.mjs";
 import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
@@ -867,6 +867,47 @@ function offlineSkills(data) {
   return { ...data, skills: data.skills.map((skill) => ({ ...skill, enabled: false })) };
 }
 
+// 记忆（#43）：本地网关没有记忆合成，模型请求也不带记忆。这里只让设置页读写的形状对得上
+// （{} 会被 zod 判为缺 memory / controls / updated_at，报「无法保存记忆」），改动在本次运行内保留。
+let MEMORY_SETTINGS;
+function memorySettings() {
+  if (!MEMORY_SETTINGS) {
+    try {
+      if (!dataManaged) MEMORY_SETTINGS = JSON.parse(fs.readFileSync(path.join(POC_MOCK, "api", "memory_settings.json"), "utf8"));
+    } catch {}
+    MEMORY_SETTINGS ??= {
+      enabled_saffron: null, enabled_saffron_search: false, enabled_melange: null,
+      memory_mode: "melange", classic_mode_available: false,
+      melange_available: false, melange_imported_at: null,
+    };
+  }
+  return MEMORY_SETTINGS;
+}
+/** memory_mode 按客户端乐观更新的同一套规则推算。 */
+function updateMemorySettings(body) {
+  const settings = memorySettings();
+  for (const key of ["enabled_saffron", "enabled_saffron_search", "enabled_melange"]) {
+    if (typeof body[key] === "boolean") settings[key] = body[key];
+  }
+  if ("enabled_melange" in body) {
+    settings.memory_mode = body.enabled_melange === true ? "melange" : body.enabled_saffron === true ? "classic" : "off";
+  } else if ("enabled_saffron" in body && settings.memory_mode !== "melange") {
+    settings.memory_mode = body.enabled_saffron === true ? "classic" : "off";
+  }
+  if (body.clear_data === true) setMemoryControls(null);
+  return settings;
+}
+const MEMORY = {
+  memory: "", controls: null, updated_at: null,
+  controls_version: null, project_import: null, project_memory_mode: null,
+};
+function setMemoryControls(controls) {
+  MEMORY.controls = controls?.length ? controls : null;
+  MEMORY.memory = (controls ?? []).map((c) => `- ${c}`).join("\n");
+  MEMORY.controls_version = controls ? crypto.randomUUID() : null;
+  MEMORY.updated_at = controls ? now() : null;
+}
+
 function restTime(value, fallback) {
   const date = value ? new Date(value) : null;
   return date && !Number.isNaN(date.getTime()) ? date.toISOString() : fallback;
@@ -965,7 +1006,7 @@ function sanitizeGeneratedTitle(raw) {
   return line.length > 80 ? `${line.slice(0, 80)}…` : line;
 }
 
-function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) {
+function generateSessionTitle(rawText, requestedModel, emptyFallback, callback, sessionId) {
   const input = extractTitleInput(rawText);
   const fallback = fallbackSessionTitle(input, emptyFallback);
   if (!input) return callback(fallback);
@@ -1004,6 +1045,7 @@ function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) 
         "x-api-key": runtime.key,
         authorization: `Bearer ${runtime.key}`,
         "anthropic-version": "2023-06-01",
+        ...opencodeSessionHeaders(target, () => sessionId),
       },
       // 网关在跑长任务时首字可能排队：标题生成等久一点，别退回“截断提示词”。
       timeout: 20000,
@@ -1066,12 +1108,29 @@ function mockApi(req, res, url) {
     return json(res, { ...base, data: merged });
   }
 
+  if (/^\/api\/organizations\/[^/]+\/memory\/settings$/.test(p)) {
+    if (method === "GET") return json(res, memorySettings());
+    return readBody(req, (raw) => json(res, updateMemorySettings(decodeJsonBody(req, raw))));
+  }
+  const memoryMatch = p.match(/^\/api\/organizations\/[^/]+\/memory(?:\/(controls|synthesize|reset))?$/);
+  if (memoryMatch) {
+    if (method === "GET" || memoryMatch[1] === "synthesize") return json(res, MEMORY);
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      if (memoryMatch[1] === "controls" && Array.isArray(body.controls)) {
+        setMemoryControls(body.controls.filter((c) => typeof c === "string"));
+      } else if (memoryMatch[1] === "reset") {
+        setMemoryControls(null);
+      }
+      json(res, MEMORY);
+    });
+  }
+
   // 录制下来的真实接口形状（mock/api/*.json）
   const apiMap = [
     [/\/reflections\/settings$/, "reflections_settings"],
     [/\/user_settings$/, "claude_code_user_settings"],
     [/\/mcp\/remote_servers_with_connection$/, "mcp_servers"],
-    [/\/memory\/settings$/, "memory_settings"],
     [/^\/api\/account_profile$/, "account_profile"],
     [/\/trial_status$/, "trial_status"],
     [/\/skills\/list-skills$/, "skills"],
@@ -1097,11 +1156,6 @@ function mockApi(req, res, url) {
             checksum: "local-1", content: { entries: {} },
           },
           mcp_servers: [],
-          memory_settings: {
-            enabled_saffron: null, enabled_saffron_search: false, enabled_melange: null,
-            memory_mode: "melange", classic_mode_available: false,
-            melange_available: false, melange_imported_at: null,
-          },
           account_profile: {
             work_function: "", conversation_preferences: null, cowork_global_instructions: null,
             cowork_instructions_union: false, conversation_preferences_cloud_max_chars: 10000,
@@ -1248,6 +1302,8 @@ function mockApi(req, res, url) {
   if (/\/library(\/|$)/.test(p)) return json(res, pageShape);
   if (/\/projects\/count$/.test(p)) return json(res, { count: 0 });
   if (/\/projects(_v2)?$/.test(p)) return json(res, pageShape);
+  // 项目页的会话列表按分页校验，{} 会抛 UnreadableProjectConversationsError（#40）。
+  if (/\/projects\/[^/]+\/conversations(_v2)?$/.test(p)) return json(res, pageShape);
   // Code 模式 OAuth：刷新 token（被通用 /v1/ 兜底吃掉会导致 stale_relogin 常驻）
   if (p === "/v1/oauth/token" && req.method === "POST") {
     return json(res, {
@@ -1384,10 +1440,6 @@ function mockApi(req, res, url) {
   if (p === "/api/organizations") {
     return jsonWithActiveOrg(res, { organizations: [ORG], data: [ORG], items: [ORG] });
   }
-  // org 级别的设置/记忆/skills 端点：未覆盖的通用 mock 形状会触发前端 parse 失败 notice
-  if (/\/memory\/settings/.test(p)) {
-    return json(res, { settings: {}, entries: [], items: [] });
-  }
   if (/\/skills\/download-dot-skill-file/.test(p)) {
     // 技能内容在 Anthropic 服务器上，本地拿不到。列表里已经都标成未启用（offlineSkills），
     // 用户手动打开时回一个明确的 404，而不是 204 空体（Claude 会报「Response body is null」）。
@@ -1469,7 +1521,7 @@ function mockApi(req, res, url) {
           stateStore.flush();
         }
         json(res, { title });
-      });
+      }, convTitleMatch[1]);
     });
   }
   const convMatch = p.match(/\/chat_conversations\/([^/]+)$/);
@@ -1571,6 +1623,7 @@ function mockApi(req, res, url) {
             authorization: `Bearer ${runtime.key}`,
             "anthropic-version": "2023-06-01",
             accept: "text/event-stream",
+            ...opencodeSessionHeaders(target, () => convUuid),
           },
         },
         (gres) => {
@@ -1821,6 +1874,7 @@ function forwardGateway(req, res, requestPath, raw) {
   }
   const target = gatewayTarget(runtime, requestPath);
   const headers = {
+    ...opencodeSessionHeaders(target, () => requestSessionId(req.headers, body)),
     ...req.headers, host: target.host, "content-length": body.length,
     "x-api-key": runtime.key, authorization: `Bearer ${runtime.key}`,
   };

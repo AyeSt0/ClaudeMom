@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isLocalNetworkHost, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isLocalNetworkHost, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, opencodeSessionHeaders, planProfile, requestSessionId, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -1434,6 +1434,25 @@ test("gateway contracts keep duplicate model names distinct and old sessions use
   assert.equal(gatewayModel(config, undefined), modelIds[0]);
   assert.equal(gatewayModel(config, "claude-native-default"), modelIds[0]);
   assert.equal(gatewayModel(config, "claude-haiku-4-5"), modelIds[2]);
+});
+
+test("OpenCode Go upstreams get a stable x-opencode-session and other upstreams get nothing", () => {
+  const opencode = new URL("https://opencode.ai/zen/go/v1/messages");
+  assert.deepEqual(opencodeSessionHeaders(new URL("https://api.deepseek.com/anthropic/v1/messages"), () => "s1"), {});
+  assert.deepEqual(opencodeSessionHeaders(opencode, () => "conv-1"), { "x-opencode-session": "conv-1" });
+  const fallback = opencodeSessionHeaders(opencode)["x-opencode-session"];
+  assert.match(fallback, /^[0-9a-f-]{36}$/);
+  assert.equal(opencodeSessionHeaders(new URL("https://api.opencode.ai/v1"), () => "")["x-opencode-session"], fallback);
+  assert.equal(opencodeSessionHeaders(opencode, () => "bad\r\nvalue")["x-opencode-session"], fallback);
+
+  const id = "11111111-2222-4333-8444-555555555555";
+  const body = (metadata) => Buffer.from(JSON.stringify({ model: "m", metadata }));
+  assert.equal(requestSessionId({ "x-claude-code-session-id": id }, body({})), id);
+  assert.equal(requestSessionId({}, body({ session_id: id })), id);
+  assert.equal(requestSessionId({}, body({ user_id: `user_abc_account_x_session_${id}` })), id);
+  assert.equal(requestSessionId({}, body({ user_id: JSON.stringify({ device_id: "d", session_id: id }) })), id);
+  assert.equal(requestSessionId({}, body({ user_id: "local-test" })), "");
+  assert.equal(requestSessionId({}, Buffer.from("not json")), "");
 });
 
 test("gateway aliases preserve the configured ID and only resolve unique window or namespace matches", () => {

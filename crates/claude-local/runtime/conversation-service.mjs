@@ -10,7 +10,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
-import { createGatewayStreamParser, gatewayHttpError, gatewayModel, gatewayTarget, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, gatewayHttpError, gatewayModel, gatewayTarget, opencodeSessionHeaders, runtimeConfig } from "./runtime.mjs";
 import {
   decode, get, asStr, asMsg, asInt, ld, vi,
   requestMessages, frame, endFrame,
@@ -32,7 +32,7 @@ function defaultGatewayRequest(target, options, callback) {
  * 调网关拿一轮回复的文本增量。
  * 返回 {next} 迭代器：{done:false,value:string} / {done:true}，出错 throw。
  */
-function anthropicStream(messages, model, signal, request = defaultGatewayRequest) {
+function anthropicStream(messages, model, signal, request = defaultGatewayRequest, sessionId) {
   const queue = [];
   let notify = null;
   let done = false, failed = null;
@@ -54,6 +54,7 @@ function anthropicStream(messages, model, signal, request = defaultGatewayReques
         authorization: `Bearer ${runtime.key}`,
         "anthropic-version": "2023-06-01",
         accept: "text/event-stream",
+        ...opencodeSessionHeaders(u, () => sessionId),
       },
     },
     (res) => {
@@ -97,8 +98,8 @@ function anthropicStream(messages, model, signal, request = defaultGatewayReques
   };
 }
 
-async function* gatewayDeltas(messages, model, signal, request = defaultGatewayRequest) {
-  const it = anthropicStream(messages, model, signal, request);
+async function* gatewayDeltas(messages, model, signal, request = defaultGatewayRequest, sessionId) {
+  const it = anthropicStream(messages, model, signal, request, sessionId);
   for (;;) {
     const r = await it.next();
     if (r.done) return;
@@ -211,7 +212,7 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
           if (previous === turn) break;
           if (previous.text) messages.push({ role: "assistant", content: previous.text });
         }
-        for await (const delta of gatewayDeltas(messages, turn.model, controller.signal, request)) {
+        for await (const delta of gatewayDeltas(messages, turn.model, controller.signal, request, conv.uuid)) {
           if (turn.complete) break;
           turn.text += delta;
           onChange();

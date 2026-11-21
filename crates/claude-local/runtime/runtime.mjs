@@ -155,6 +155,34 @@ export function gatewayTarget(config, requestPath) {
   return target;
 }
 
+const OPENCODE_FALLBACK_SESSION = crypto.randomUUID();
+
+/**
+ * OpenCode Go（opencode.ai）要求每个请求带 x-opencode-session，缺了回 400 MissingSessionID（#42）。
+ * 它按会话分缓存，同一会话要一直用同一个值：`sessionId()` 给出会话 ID；没有会话的请求
+ * （标题生成、Claude 的模型探测）用进程启动时生成的固定值。其它上游不加。
+ */
+export function opencodeSessionHeaders(target, sessionId = () => "") {
+  if (!/(^|\.)opencode\.ai$/i.test(target.hostname)) return {};
+  const value = sessionId();
+  const valid = typeof value === "string" && /^[\x21-\x7e]{1,200}$/.test(value);
+  return { "x-opencode-session": valid ? value : OPENCODE_FALLBACK_SESSION };
+}
+
+/** /v1/messages 请求里 Claude 自己的会话 ID：请求头，或 metadata 里的 session_id / user_id 中的会话段。 */
+export function requestSessionId(headers, body) {
+  const header = headers["x-claude-code-session-id"];
+  if (typeof header === "string" && header) return header;
+  try {
+    const metadata = JSON.parse(body.toString("utf8"))?.metadata;
+    if (typeof metadata?.session_id === "string" && metadata.session_id) return metadata.session_id;
+    if (typeof metadata?.user_id === "string") {
+      return metadata.user_id.match(/session(?:_id)?["':_\s]*([0-9a-f]{8}-[0-9a-f-]{27})/i)?.[1] || "";
+    }
+  } catch {}
+  return "";
+}
+
 const WINDOW_SUFFIX = /\[\d+[km]\]$/i;
 
 function uniqueModelAlias(models, requested) {

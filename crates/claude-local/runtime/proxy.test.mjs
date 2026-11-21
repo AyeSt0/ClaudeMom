@@ -751,6 +751,41 @@ test("Cowork plugin metadata is a dictionary rather than a paginated list", asyn
   assert.deepEqual(result.body, {});
 });
 
+test("memory settings and memory edits answer in the shapes the settings page validates", async () => {
+  const settings = "/api/organizations/local/memory/settings";
+  const off = await request(settings, { host: "claude.ai", body: { enabled_melange: false, enabled_saffron: false } });
+  assert.equal(off.status, 200);
+  assert.equal(off.body.memory_mode, "off");
+  assert.equal(off.body.enabled_saffron, false);
+  assert.equal((await request(settings, { host: "claude.ai" })).body.memory_mode, "off");
+  const classic = await request(settings, { host: "claude.ai", body: { enabled_melange: false, enabled_saffron: true } });
+  assert.equal(classic.body.memory_mode, "classic");
+
+  const memory = await request("/api/organizations/local/memory?project_uuid=p1", { host: "claude.ai" });
+  assert.equal(memory.status, 200);
+  assert.equal(typeof memory.body.memory, "string");
+  assert.ok("controls" in memory.body && "updated_at" in memory.body);
+
+  const saved = await request("/api/organizations/local/memory/controls", {
+    host: "claude.ai", method: "PUT", body: { controls: ["喜欢简短的回答"], base_controls_version: null },
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.controls, ["喜欢简短的回答"]);
+  assert.equal(typeof saved.body.controls_version, "string");
+  assert.ok(!Number.isNaN(Date.parse(saved.body.updated_at)));
+  assert.deepEqual((await request("/api/organizations/local/memory", { host: "claude.ai" })).body.controls, ["喜欢简短的回答"]);
+
+  const reset = await request("/api/organizations/local/memory/reset", { host: "claude.ai", body: {} });
+  assert.equal(reset.body.controls, null);
+});
+
+test("project conversation lists are pages rather than empty objects", async () => {
+  const result = await request("/api/organizations/local/projects/p1/conversations_v2?limit=30&offset=0", { host: "claude.ai" });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.data, []);
+  assert.equal(result.body.pagination.has_more, false);
+});
+
 test("local mock accounts do not request identity verification", async () => {
   const result = await request("/api/organizations/local/kyc_status", { host: "claude.ai" });
   assert.equal(result.status, 200);
