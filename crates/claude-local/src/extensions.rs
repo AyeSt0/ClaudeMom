@@ -432,7 +432,7 @@ pub fn remove(id: &str) -> Result<String> {
 }
 
 /// 要注入页面的一个文件。`style` 为真是 css，否则是 js。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PageAsset {
     pub id: String,
     pub file: String,
