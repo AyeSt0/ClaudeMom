@@ -20,9 +20,9 @@ pub mod winproc;
 pub mod dictation;
 
 pub use backend::{
-    ClaudeLocalResult, ClaudeLocalStatus, TemplateVersion, configure, friendly_model_name, inherited_context_tokens,
-    launch_claude, perform, pick_context_tokens, private_dir, reap_stale_proxy, resume_attached_proxy,
-    shutdown_on_exit, status, stop_backend,
+    ClaudeLocalResult, ClaudeLocalStatus, TemplateVersion, configure, desktop_process_listing, friendly_model_name,
+    inherited_context_tokens, launch_claude, perform, pick_context_tokens, private_dir, reap_stale_proxy,
+    resume_attached_proxy, shutdown_on_exit, status, stop_backend,
 };
 pub use host::{Host, Upstream, install_host};
 pub use settings::ClaudeLocalSettings;

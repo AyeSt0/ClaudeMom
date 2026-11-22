@@ -1170,6 +1170,13 @@ fn claude_processes() -> Result<String> {
     Ok(String::new())
 }
 
+/// 当前用户的 Claude Desktop 进程清单，每行 `{pid} {命令行}`，含 Electron 子进程（`--type=`）
+/// 和补丁副本这类同名进程，按命令行自行区分。给宿主的「自动接管」用：它要认出用户自己开的
+/// 官方 Claude（没有 `--proxy-server=http://127.0.0.1:<port>`），退出后再经本地服务重开。
+pub fn desktop_process_listing() -> Result<String> {
+    claude_processes()
+}
+
 #[cfg(target_os = "macos")]
 fn version(source: &Path) -> String {
     if !source.is_dir() {
