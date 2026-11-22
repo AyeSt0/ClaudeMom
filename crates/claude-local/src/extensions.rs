@@ -431,6 +431,66 @@ pub fn remove(id: &str) -> Result<String> {
     remove_in(&crate::backend::root_dir(), id)
 }
 
+/// 要注入页面的一个文件。`style` 为真是 css，否则是 js。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageAsset {
+    pub id: String,
+    pub file: String,
+    pub style: bool,
+    pub body: String,
+}
+
+/// 启用中的扩展要注入的文件，顺序和本地服务插标签的一样：按 id，每个扩展先样式后脚本。
+/// 给不经本地服务的注入方式用（Codex++ 的补丁副本在主进程里注入）；取文件的规则同
+/// runtime/extensions.mjs 的 `read`：内置的优先，只取清单里列的，不跟符号链接，不出扩展自己的文件夹。
+pub fn enabled_assets() -> Vec<PageAsset> {
+    enabled_assets_in(&crate::backend::root_dir())
+}
+
+fn enabled_assets_in(root: &Path) -> Vec<PageAsset> {
+    let builtin = builtin_manifests();
+    let mut assets = Vec::new();
+    for id in read_enabled(root) {
+        let dir = root.join(USER_DIR).join(&id);
+        let shipped = builtin.iter().find(|manifest| manifest.id == id);
+        let manifest = match shipped {
+            Some(manifest) => manifest.clone(),
+            None if fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) => {
+                match fs::read(dir.join("manifest.json")).ok().and_then(|raw| parse_manifest(&raw, Some(&id)).ok()) {
+                    Some(manifest) => manifest,
+                    None => continue,
+                }
+            }
+            None => continue,
+        };
+        let files = manifest.styles.iter().map(|file| (file, true)).chain(manifest.scripts.iter().map(|file| (file, false)));
+        for (file, style) in files {
+            let body = if shipped.is_some() { builtin_file(&id, file) } else { user_file(&dir, file) };
+            if let Some(body) = body.and_then(|body| String::from_utf8(body).ok()) {
+                assets.push(PageAsset { id: id.clone(), file: file.clone(), style, body });
+            }
+        }
+    }
+    assets
+}
+
+fn builtin_file(id: &str, file: &str) -> Option<Vec<u8>> {
+    let path = format!("{BUILTIN_DIR}/{id}/{file}");
+    BUILTIN.iter().find(|(name, _)| *name == path).map(|(_, body)| body.to_vec())
+}
+
+fn user_file(dir: &Path, file: &str) -> Option<Vec<u8>> {
+    let path = dir.join(file);
+    if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        return None;
+    }
+    let real = path.canonicalize().ok()?;
+    if !real.starts_with(dir.canonicalize().ok()?) {
+        return None;
+    }
+    fs::read(real).ok()
+}
+
 /// 在访达 / 资源管理器里打开用户扩展文件夹。
 pub fn open_folder() -> Result<()> {
     let dir = crate::backend::root_dir().join(USER_DIR);
@@ -557,6 +617,33 @@ mod tests {
         assert!(broken.error.as_deref().unwrap().contains("不一致"));
         assert!(set_enabled_in(root.path(), "broken", true).is_err());
         assert!(set_enabled_in(root.path(), "broken", false).is_ok());
+    }
+
+    #[test]
+    fn enabled_assets_follow_the_page_injection_order_and_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        write_package(source.path(), "theme", "1.0.0");
+        import_in(root.path(), source.path()).unwrap();
+        assert!(enabled_assets_in(root.path()).is_empty());
+
+        set_enabled_in(root.path(), "theme", true).unwrap();
+        set_enabled_in(root.path(), "wide-chat", true).unwrap();
+        let assets = enabled_assets_in(root.path());
+        let order: Vec<_> = assets.iter().map(|asset| (asset.id.as_str(), asset.file.as_str(), asset.style)).collect();
+        assert_eq!(order, [("theme", "css/a.css", true), ("theme", "main.js", false), ("wide-chat", "wide-chat.js", false)]);
+        assert_eq!(assets[1].body, "window.main = 1;");
+        assert!(assets[2].body.contains("transcript-width"), "内置扩展取随程序打包的那份");
+
+        // 指到扩展文件夹外的符号链接不取。
+        #[cfg(unix)]
+        {
+            let main = root.path().join("extensions/theme/main.js");
+            fs::remove_file(&main).unwrap();
+            std::os::unix::fs::symlink("/etc/hosts", &main).unwrap();
+            let files: Vec<_> = enabled_assets_in(root.path()).into_iter().map(|asset| asset.file).collect();
+            assert_eq!(files, ["css/a.css", "wide-chat.js"]);
+        }
     }
 
     #[test]
