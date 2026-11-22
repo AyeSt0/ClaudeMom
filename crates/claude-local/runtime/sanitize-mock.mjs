@@ -6,9 +6,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const SRC = process.argv[2] ?? path.join(path.dirname(new URL(import.meta.url).pathname), "mock");
-const TEMPLATES = process.argv[3] ?? path.join(path.dirname(new URL(import.meta.url).pathname), "mock-templates");
+const here = path.dirname(fileURLToPath(import.meta.url));
+const SRC = process.argv[2] ?? path.join(here, "mock");
+const TEMPLATES = process.argv[3] ?? path.join(here, "mock-templates");
 const SOURCE_BUILD = (() => {
   try { return JSON.parse(fs.readFileSync(path.join(SRC, "bootstrap.json"), "utf8")).gated_imports_build_id; } catch { return undefined; }
 })();
@@ -192,5 +194,7 @@ function exportShell(identity = null) {
   console.warn(`! 没在 ${cacheDir} 找到 build ${buildId ?? "（未知）"} 的页面外壳：shell.html 缺失，这个版本不能用（build.rs 会报错）`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) run();
+// 比较前把 argv[1] 解析成真实路径再转成 file URL：Windows 的反斜杠路径、路径里的空格、
+// 经过符号链接的路径（Node 给 import.meta.url 的是真实路径），直接拼出来都对不上，脚本会什么都不做。
+if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) run();
 export { scrub, sanitizeFile, recordedIdentity, redactIdentity, ACCOUNT_UUID, ORG_UUID };
