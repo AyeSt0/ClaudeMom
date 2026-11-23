@@ -177,7 +177,8 @@
 
   function supports(name) {
     const feature = String(name || "");
-    const check = mountSupport.get(feature) || mountSupport.get(feature.split(":")[0]);
+    // 带细分的问法（registerSlot:composer.above）只认登记过的那一项，不拿「registerSlot 总体可用」充数。
+    const check = mountSupport.get(feature);
     if (!check) return false;
     try {
       return check(feature) !== false;
@@ -1051,6 +1052,730 @@
     mountSupport.set(name, () => true);
   }
 
+  // ------------------------------------------------------------------ 挂在 Claude 界面上的位置
+  // 下面这些挂载点要挂在 Claude 自己的 DOM 上，位置来自锚点表（page-anchors.js）。约定：
+  //   - 每个宿主函数都幂等：按「登记了哪些项」算一个指纹写在容器上，指纹没变就不动 DOM；
+  //   - 样子照原生控件：按钮、侧栏行直接克隆旁边的原生控件再换图标和文字，Claude 改了样式自动跟着变；
+  //   - 锚点找不到就什么都不做（并回报「没挂上」），不抛错。
+  const anchorList = (name) => (Array.isArray(anchors[name]) ? anchors[name] : []);
+  const find = (name, root = document) => {
+    for (const selector of anchorList(name)) {
+      const node = root.querySelector(selector);
+      if (node && !node.closest(`[${OWN_ATTR}]`)) return node;
+    }
+    return null;
+  };
+  const findAll = (name, root = document) => {
+    for (const selector of anchorList(name)) {
+      const nodes = [...root.querySelectorAll(selector)].filter((node) => !node.closest(`[${OWN_ATTR}]`));
+      if (nodes.length) return nodes;
+    }
+    return [];
+  };
+  const lca = (a, b) => {
+    for (let node = a; node; node = node.parentElement) if (node.contains(b)) return node;
+    return null;
+  };
+  const childOf = (parent, node) => {
+    let cursor = node;
+    while (cursor && cursor.parentElement !== parent) cursor = cursor.parentElement;
+    return cursor;
+  };
+  const ownChild = (parent, name) => [...parent.children].find((child) => child.getAttribute(OWN_ATTR) === name) || null;
+  const insertAfter = (reference, node) => reference.parentElement.insertBefore(node, reference.nextElementSibling);
+  /** 记下某个挂载点现在挂上了没有（只在有东西要挂的时候记）。 */
+  const setMount = (name, ok) => {
+    const value = ok ? "ok" : "missing";
+    if (mounts[name] === value) return;
+    mounts[name] = value;
+    scheduleReport();
+  };
+  const fingerprint = (items, extra = "") => (items.length ? `${items.map((item) => item.id).join("|")}#${extra}` : "");
+
+  /**
+   * 取（或重建）parent 下名为 name 的宿主容器。指纹没变返回 null（不用重画）；指纹为空表示没有东西要放，只清掉旧的。
+   * 容器里交给拓展画过的内容有清理函数时，换掉容器前先调。
+   */
+  const hostCleanups = new WeakMap();
+  function dropHost(node) {
+    for (const cleanup of hostCleanups.get(node) || []) runCallback(cleanup.scriptKey, "cleanup", cleanup.run);
+    hostCleanups.delete(node);
+    node.remove();
+  }
+  function ensureHost(parent, name, print, tag, place) {
+    const existing = ownChild(parent, name);
+    if (existing && existing.getAttribute("data-fp") === print) return null;
+    if (existing) dropHost(existing);
+    if (!print) return null;
+    const node = own(el(tag), name);
+    node.setAttribute("data-fp", print);
+    place(node);
+    return node;
+  }
+
+  const STRIP_ATTRIBUTE = /^(id|href|target|rel|disabled|data-testid|data-state|data-selected|data-cds|aria-.+)$/;
+  function stripClone(node) {
+    for (const name of node.getAttributeNames()) if (STRIP_ATTRIBUTE.test(name)) node.removeAttribute(name);
+    for (const child of node.children) stripClone(child);
+  }
+  function iconNode(icon, fallback) {
+    const node = el("span", { class: "codex-plus-icon", "aria-hidden": "true" });
+    setIcon(node, icon, fallback);
+    return node;
+  }
+  /** 照原生图标按钮（输入框的加号、消息操作行的复制）克隆一个，换上自己的图标。 */
+  function cloneIconButton(sample, label, icon) {
+    const button = sample.cloneNode(true);
+    stripClone(button);
+    button.setAttribute("aria-label", label);
+    button.setAttribute("title", label);
+    button.setAttribute("type", "button");
+    const holder = button.lastElementChild || button;
+    holder.textContent = "";
+    holder.append(iconNode(icon, "◆"));
+    return button;
+  }
+  /** 照原生侧栏行克隆一个：第一个子元素是图标位，第二个里最深的那个是文字，其余（快捷键提示等）去掉。 */
+  function cloneNavRow(sample, label, icon) {
+    const row = sample.cloneNode(true);
+    stripClone(row);
+    row.setAttribute("role", "button");
+    row.setAttribute("tabindex", "0");
+    row.setAttribute("title", label);
+    const [slot, labelWrap, ...rest] = [...row.children];
+    for (const extra of rest) extra.remove();
+    if (slot) {
+      slot.textContent = "";
+      slot.append(iconNode(icon, "✦"));
+    }
+    let text = labelWrap || row;
+    while (text.firstElementChild) text = text.firstElementChild;
+    text.textContent = label;
+    return row;
+  }
+  /** 点击和回车 / 空格都触发（克隆出来的行不一定是 button）。 */
+  function onActivate(node, handler) {
+    node.addEventListener("click", (event) => {
+      event.preventDefault();
+      handler(event);
+    });
+    node.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      handler(event);
+    });
+  }
+
+  // ---- 侧栏入口：registerPage / registerNavEntry
+  function refreshRail() {
+    const entries = itemsOf(registry.navEntries);
+    const rows = find("navRows");
+    const sample = rows && [...rows.querySelectorAll("a")].find((link) => link.children.length >= 2);
+    if (!rows || !sample) {
+      if (entries.length) setMount("rail", false);
+      if (railMounted) {
+        railMounted = false;
+        refreshBall();
+      }
+      return;
+    }
+    const lastRow = [...rows.children].filter((child) => !child.hasAttribute(OWN_ATTR) && (child.tagName === "A" || child.querySelector("a"))).pop();
+    const host = ensureHost(rows, "rail", fingerprint(entries, openPage?.pageId || ""), "div", (node) => (lastRow ? insertAfter(lastRow, node) : rows.append(node)));
+    if (host) {
+      for (const entry of entries) {
+        const row = cloneNavRow(sample, resolveText(entry.label), entry.icon);
+        own(row, "rail-entry");
+        if (entry.pageId) {
+          row.setAttribute(constants.pageNavAttribute, entry.pageId);
+          if (openPage?.pageId === entry.pageId) row.setAttribute("data-selected", "open");
+        }
+        onActivate(row, () => activateNavEntry(entry));
+        host.append(row);
+      }
+    }
+    if (entries.length) setMount("rail", true);
+    const mounted = entries.length > 0;
+    if (railMounted !== mounted) {
+      railMounted = mounted;
+      refreshBall();
+    }
+  }
+
+  // ---- 输入框
+  const editorSelector = () => anchorList("composerEditor").join(", ");
+  const composerEditorFrom = (target) => (editorSelector() && target?.closest ? target.closest(editorSelector()) : null);
+  /** 输入区的几个部件：编辑器、工具行、左边那一组、外框。找不全返回 null。 */
+  function composerParts() {
+    const editor = find("composerEditor");
+    const leading = find("composerLeading");
+    const trailing = find("composerTrailing");
+    if (!editor || !leading || !trailing) return null;
+    const row = lca(leading, trailing);
+    const group = row && childOf(row, leading);
+    if (!row || !group || row.contains(editor)) return null;
+    const inner = lca(editor, row);
+    let box = null;
+    for (const selector of anchorList("composerBox")) {
+      box = inner?.closest(selector) || null;
+      if (box) break;
+    }
+    return { editor, leading, row, group, box: box || inner?.parentElement || inner };
+  }
+  /** 往输入框光标处写字。Claude 的输入框是富文本编辑器，直接改 DOM 会被它盖掉，要走它认的输入命令。 */
+  function insertIntoEditor(editor, text) {
+    if (!editor) return false;
+    editor.focus();
+    return document.execCommand("insertText", false, String(text ?? ""));
+  }
+  function setEditorText(editor, text) {
+    if (!editor) return false;
+    editor.focus();
+    const selection = window.getSelection();
+    selection?.selectAllChildren(editor);
+    return text ? document.execCommand("insertText", false, String(text)) : document.execCommand("delete");
+  }
+  function refreshComposerActions() {
+    const actions = itemsOf(registry.composerActions);
+    const parts = composerParts();
+    if (!parts) {
+      if (actions.length) setMount("composer", false);
+      return;
+    }
+    const host = ensureHost(parts.group, "composer-actions", fingerprint(actions), "span", (node) => parts.group.append(node));
+    if (host) {
+      for (const action of actions) {
+        const button = cloneIconButton(parts.leading, resolveText(action.label), action.icon);
+        button.setAttribute(EXT_ATTR, action.scriptKey || "runtime");
+        onActivate(button, () => {
+          const editor = find("composerEditor");
+          runCallback(action.scriptKey, `composerAction:${action.id}`, () => action.onActivate({ editor, insertText: (text) => insertIntoEditor(editor, text), close() {} }));
+        });
+        host.append(button);
+      }
+    }
+    if (actions.length) setMount("composer", true);
+  }
+
+  // ---- 输入提示：斜杠命令和输入触发共用一块候选面板
+  let hint = null;
+  function closeHint() {
+    hint = null;
+    document.querySelector(`[${OWN_ATTR}="hints"]`)?.remove();
+  }
+  function renderHint() {
+    if (!hint || !hint.items.length) {
+      document.querySelector(`[${OWN_ATTR}="hints"]`)?.remove();
+      return;
+    }
+    let panel = document.querySelector(`[${OWN_ATTR}="hints"]`);
+    if (!panel) {
+      panel = own(el("div", { role: "listbox" }), "hints");
+      document.body.append(panel);
+    }
+    panel.replaceChildren(...hint.items.map((choice, index) => {
+      const row = el("button", { type: "button", class: "codex-plus-hint", role: "option", "aria-selected": String(index === hint.active) }, [
+        el("strong", { text: String(choice.label ?? choice.insert ?? "") }),
+        choice.description ? el("span", { text: String(choice.description) }) : null,
+      ]);
+      row.addEventListener("pointerdown", (event) => event.preventDefault());
+      row.addEventListener("click", () => acceptHint(choice));
+      return row;
+    }));
+    const rect = hint.editor.getBoundingClientRect();
+    panel.style.left = `${Math.round(rect.left)}px`;
+    panel.style.bottom = `${Math.round(window.innerHeight - rect.top + 8)}px`;
+    panel.style.minWidth = `${Math.round(Math.min(rect.width, 420))}px`;
+  }
+  function acceptHint(choice) {
+    const current = hint;
+    if (!current || !choice) return;
+    closeHint();
+    current.accept(choice);
+  }
+  /** 光标前的文字（只看光标所在的文本节点，不受富文本结构影响）。 */
+  function textBeforeCaret(editor) {
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount || !selection.isCollapsed) return null;
+    const node = selection.anchorNode;
+    if (!node || !editor.contains(node) || node.nodeType !== 3) return null;
+    return node.textContent.slice(0, selection.anchorOffset);
+  }
+  function matchTrigger(before) {
+    let best = null;
+    for (const item of itemsOf(registry.inputTriggers)) {
+      const index = before.lastIndexOf(item.trigger);
+      if (index < 0 || (index > 0 && !/\s/.test(before[index - 1]))) continue;
+      const query = before.slice(index + item.trigger.length);
+      if (/\s/.test(query) || query.length > 64) continue;
+      if (!best || index > best.index || (index === best.index && item.trigger.length > best.item.trigger.length)) best = { item, index, query };
+    }
+    return best;
+  }
+  async function updateHints(editor) {
+    const whole = String(editor.textContent || "");
+    // 斜杠命令：整段是「/名字」且还没打空格时，列出匹配的拓展命令。
+    const command = /^\/([\w-]*)$/.exec(whole.trim());
+    if (command && registry.commands.size) {
+      const items = itemsOf(registry.commands)
+        .filter((item) => item.name.startsWith(command[1]))
+        .map((item) => ({ label: `/${item.name}`, description: resolveText(item.description), insert: `/${item.name} ` }));
+      hint = { editor, items, active: 0, accept: (choice) => setEditorText(editor, choice.insert) };
+      return renderHint();
+    }
+    const before = registry.inputTriggers.size ? textBeforeCaret(editor) : null;
+    const match = before === null ? null : matchTrigger(before);
+    if (!match) return closeHint();
+    const token = {};
+    const accept = (choice) => {
+      editor.focus();
+      const selection = window.getSelection();
+      for (let index = 0; index < match.item.trigger.length + match.query.length; index += 1) selection.modify("extend", "backward", "character");
+      document.execCommand("insertText", false, String(choice.insert ?? choice.label ?? ""));
+      if (typeof choice.onSelect === "function") runCallback(match.item.scriptKey, "inputTrigger.onSelect", () => choice.onSelect());
+    };
+    hint = { editor, items: hint?.items || [], active: 0, accept, token };
+    const result = runCallback(match.item.scriptKey, `inputTrigger.items:${match.item.trigger}`, () => match.item.items(match.query, { editor }));
+    if (!result.ok) return closeHint();
+    let items;
+    try {
+      items = await result.value;
+    } catch (error) {
+      markFailure(match.item.scriptKey, `inputTrigger.items: ${errorText(error)}`);
+      return closeHint();
+    }
+    // 等候选期间又输入了：以最新一次为准。
+    if (hint?.token !== token) return;
+    hint.items = (Array.isArray(items) ? items : []).filter((choice) => choice && typeof choice === "object").slice(0, 12);
+    renderHint();
+  }
+  /** 回车时整段是「/名字 参数」且名字是拓展登记的命令：拦下来交给拓展，不发给 Claude。 */
+  function runCommandFrom(editor, event) {
+    const match = /^\/([\w-]+)(?:\s+([\s\S]*))?$/.exec(String(editor.textContent || "").trim());
+    const command = match && itemsOf(registry.commands).find((item) => item.name === match[1]);
+    if (!command) return false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeHint();
+    setEditorText(editor, "");
+    const context = {
+      editor,
+      sessionId: currentSessionId(),
+      insertText: (text) => insertIntoEditor(editor, text),
+      setText: (text) => setEditorText(editor, text),
+      toast: (message, options) => showToast(String(message ?? ""), options || {}),
+    };
+    const result = runCallback(command.scriptKey, `command:/${command.name}`, () => command.run(match[2] || "", context));
+    if (result.ok && isThenable(result.value)) result.value.catch((error) => markFailure(command.scriptKey, `command:/${command.name}: ${errorText(error)}`));
+    return true;
+  }
+  let composerHandlers = false;
+  function installComposerHandlers() {
+    if (composerHandlers) return;
+    composerHandlers = true;
+    // 都在 window 的捕获阶段接：编辑器自己在更里面处理按键，等事件到它那里就来不及拦了。
+    window.addEventListener("input", (event) => {
+      if (!registry.commands.size && !registry.inputTriggers.size) return;
+      const editor = composerEditorFrom(event.target);
+      if (editor) void updateHints(editor);
+    }, true);
+    window.addEventListener("keydown", (event) => {
+      if (event.isComposing) return;
+      const editor = composerEditorFrom(event.target);
+      if (!editor) return;
+      if (hint && hint.items.length) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          return closeHint();
+        }
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          hint.active = (hint.active + (event.key === "ArrowDown" ? 1 : -1) + hint.items.length) % hint.items.length;
+          return renderHint();
+        }
+        if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey && hint.token)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          return acceptHint(hint.items[hint.active]);
+        }
+      }
+      if (event.key === "Enter" && !event.shiftKey && registry.commands.size) runCommandFrom(editor, event);
+    }, true);
+    window.addEventListener("focusout", (event) => {
+      if (hint && event.target === hint.editor) setTimeout(() => hint && !hint.editor.contains(document.activeElement) && closeHint(), 150);
+    }, true);
+  }
+  function registerCommand(definition, options = {}) {
+    const name = String(definition?.name || "");
+    if (!/^[\w-]{1,32}$/.test(name)) throw new Error("命令名只能是字母、数字、_、-，最长 32");
+    if (typeof definition.run !== "function") throw new Error(`命令 /${name} 需要 run(args, context)`);
+    if (itemsOf(registry.commands).some((item) => item.name === name)) throw new Error(`命令 /${name} 已经被别的拓展登记了`);
+    installComposerHandlers();
+    return registerItem("command", registry.commands, "registerCommand", { ...definition, name }, { ...options, id: options.id || `command-${name}` });
+  }
+  function registerInputTrigger(definition, options = {}) {
+    const trigger = String(definition?.trigger || "");
+    if (/^[@/]/.test(trigger)) throw new Error(`触发符 ${trigger[0]} 是 Claude 自己在用的（@ 提及、/ 命令），换一个，例如 "#"`);
+    if (!/^[#%&~!^:+$][\w-]{0,7}$/.test(trigger)) throw new Error('trigger 是一个符号开头的短前缀，例如 "#"、"%"、"#issue"');
+    if (typeof definition.items !== "function") throw new Error(`输入触发 ${trigger} 需要 items(query) 返回候选`);
+    installComposerHandlers();
+    return registerItem("inputTrigger", registry.inputTriggers, "registerInputTrigger", { ...definition, trigger }, options);
+  }
+
+  // ---- 消息：操作按钮和正文下方的装饰
+  const turnAttribute = () => (typeof anchors.turnAttribute === "string" ? anchors.turnAttribute : "data-turn-key");
+  function messageOf(node, role) {
+    const id = node.closest(`[${turnAttribute()}]`)?.getAttribute(turnAttribute()) || "";
+    const content = role === "assistant" ? find("assistantContent", node) || node : node;
+    return { role, id, turnId: id, conversationId: currentSessionId(), text: String(content.innerText ?? content.textContent ?? "").trim(), element: node };
+  }
+  const forRole = (item, role) => {
+    const roles = item.roles === undefined ? [] : [].concat(item.roles);
+    return !roles.length || roles.includes(role);
+  };
+  const visibleFor = (item, message) => {
+    if (typeof item.visible !== "function") return true;
+    const result = runCallback(item.scriptKey, `${item.kind}.visible`, () => item.visible(message));
+    return result.ok && result.value !== false;
+  };
+  function refreshMessages() {
+    const wanted = registry.messageActions.size + registry.messageDecorations.size + [...registry.slots.values()].filter((item) => item.slot === "turn.after").length;
+    const nodes = [...findAll("userMessage").map((node) => [node, "user"]), ...findAll("assistantMessage").map((node) => [node, "assistant"])];
+    if (!nodes.length) {
+      // 没有消息的页面（新对话）不算没挂上。
+      return;
+    }
+    let barFound = false;
+    for (const [node, role] of nodes) {
+      const message = messageOf(node, role);
+      // 操作按钮：回复的操作行在消息节点里；用户消息的在它所在的那一轮里。
+      const scope = role === "assistant" ? node : node.closest(`[${turnAttribute()}]`) || node.parentElement;
+      const bar = scope && find(role === "assistant" ? "assistantActions" : "userActions", scope);
+      const sample = bar && [...bar.children].find((child) => child.tagName === "BUTTON");
+      if (bar && sample) {
+        barFound = true;
+        const actions = itemsOf(registry.messageActions).filter((item) => forRole(item, role) && visibleFor(item, message));
+        // 插在时间戳前面，和原生按钮挨在一起。
+        const before = [...bar.children].find((child) => child.tagName === "TIME") || null;
+        const host = ensureHost(bar, "message-actions", fingerprint(actions), "span", (created) => bar.insertBefore(created, before));
+        if (host) {
+          for (const action of actions) {
+            const button = cloneIconButton(sample, resolveText(action.label), action.icon);
+            button.setAttribute(EXT_ATTR, action.scriptKey || "runtime");
+            onActivate(button, () => runCallback(action.scriptKey, `messageAction:${action.id}`, () => action.onActivate({ message: messageOf(node, role), close() {} })));
+            host.append(button);
+          }
+        }
+      }
+      // 装饰：回复的放在正文和操作行之间，用户消息的放在气泡下面。文字变了（流式输出）重画。
+      const decorations = itemsOf(registry.messageDecorations).filter((item) => forRole(item, role) && visibleFor(item, message));
+      const parent = role === "assistant" ? node : node.parentElement;
+      if (parent) {
+        const host = ensureHost(parent, "message-decorations", fingerprint(decorations, `${message.id}:${message.text.length}`), "div", (created) => {
+          if (role === "assistant") parent.insertBefore(created, bar ? childOf(parent, bar) : null);
+          else insertAfter(node, created);
+        });
+        if (host) {
+          for (const item of decorations) {
+            const container = el("div", { [EXT_ATTR]: item.scriptKey || "runtime" });
+            host.append(container);
+            runCallback(item.scriptKey, `messageDecoration:${item.id}`, () => item.render({ message, container }));
+          }
+        }
+      }
+      if (role === "assistant") renderSlot("turn.after", node, (created) => node.append(created), { turnKey: message.id }, `slot:turn.after`);
+    }
+    if (wanted) setMount("messages", barFound || !registry.messageActions.size);
+  }
+
+  // ---- 固定位置的插槽：registerSlot
+  /** 把登记在 name 上的插槽画进 parent 下的一个容器；容器新建时各调一次 render，可返回清理函数。 */
+  function renderSlot(name, parent, place, context = {}, hostName = `slot:${name}`) {
+    const slots = itemsOf(registry.slots).filter((item) => item.slot === name);
+    const host = ensureHost(parent, hostName, fingerprint(slots, String(context.turnKey || context.sessionId || "")), "div", place);
+    if (!host) return;
+    const cleanups = [];
+    for (const item of slots) {
+      const container = el("div", { [EXT_ATTR]: item.scriptKey || "runtime" });
+      host.append(container);
+      const result = runCallback(item.scriptKey, `slot:${name}`, () => item.render({ container, slot: name, ...context }));
+      if (result.ok && typeof result.value === "function") cleanups.push({ scriptKey: item.scriptKey, run: result.value });
+    }
+    hostCleanups.set(host, cleanups);
+  }
+  /** 各插槽在哪：返回 [父节点, 放置函数]，这个页面上没有对应位置时返回 null。 */
+  const slotPlaces = {
+    "composer.above": () => {
+      const box = composerParts()?.box;
+      return box?.parentElement ? [box.parentElement, (node) => box.parentElement.insertBefore(node, box)] : null;
+    },
+    "composer.below": () => {
+      const box = composerParts()?.box;
+      return box?.parentElement ? [box.parentElement, (node) => insertAfter(box, node)] : null;
+    },
+    "thread.top": () => {
+      const list = find("transcript");
+      return list ? [list, (node) => list.insertBefore(node, list.firstElementChild)] : null;
+    },
+    "thread.bottom": () => {
+      const list = find("transcript");
+      const end = list && find("transcriptEnd", list);
+      return list ? [end?.parentElement || list, (node) => (end ? end.parentElement.insertBefore(node, end) : list.append(node))] : null;
+    },
+    "sidebar.top": () => {
+      const rows = find("navRows");
+      return rows?.parentElement ? [rows.parentElement, (node) => rows.parentElement.insertBefore(node, rows)] : null;
+    },
+    "sidebar.bottom": () => {
+      const sidebar = find("sidebar");
+      const footer = sidebar && find("sidebarFooter", sidebar);
+      const tray = footer && childOf(sidebar, footer);
+      return tray ? [sidebar, (node) => sidebar.insertBefore(node, tray)] : null;
+    },
+    titlebar: () => {
+      const group = find("headerActions");
+      return group ? [group, (node) => group.insertBefore(node, group.firstElementChild)] : null;
+    },
+    // 盖在整个页面上的一层，不依赖 Claude 的 DOM；默认不接鼠标，拓展自己的内容要接时设 pointer-events:auto。
+    overlay: () => (document.body ? [document.body, (node) => document.body.append(node)] : null),
+  };
+  function refreshSlots() {
+    for (const [name, place] of Object.entries(slotPlaces)) {
+      const used = [...registry.slots.values()].some((item) => item.slot === name);
+      const target = place();
+      if (!target) {
+        // 新对话页没有对话区、没有头部按钮组：不算没挂上，等切到有的页面再挂。
+        continue;
+      }
+      renderSlot(name, target[0], target[1]);
+      if (used) setMount(`slot:${name}`, true);
+    }
+    // 会话行后缀：最近对话列表的每一行。
+    const rowSlots = [...registry.slots.values()].some((item) => item.slot === "sessionRow.suffix");
+    for (const row of sessionRows()) {
+      renderSlot("sessionRow.suffix", row.controls, (node) => row.controls.insertBefore(node, row.controls.firstElementChild), { sessionId: row.sessionId, title: row.title });
+    }
+    if (rowSlots && sessionRows().length) setMount("slot:sessionRow.suffix", true);
+  }
+
+  // ---- 会话行：registerRowAction
+  /** 最近对话列表里的行：{ row, link, controls（放「更多选项」的那个容器）, sample（原生按钮）, sessionId, title }。 */
+  function sessionRows() {
+    const recents = find("recents");
+    if (!recents) return [];
+    const out = [];
+    for (const link of recents.querySelectorAll("a")) {
+      const id = /\/chat\/([0-9a-f-]{8,})/i.exec(String(link.getAttribute("href") || ""))?.[1];
+      const row = link.parentElement;
+      const sample = id && row ? [...row.querySelectorAll("button")].find((button) => !button.closest(`[${OWN_ATTR}]`)) : null;
+      if (!id || !sample) continue;
+      out.push({ row, link, controls: sample.parentElement, sample, sessionId: id, title: String(link.textContent || "").trim() });
+    }
+    return out;
+  }
+  function refreshRowActions() {
+    const actions = itemsOf(registry.rowActions).filter((item) => !item.surfaces || [].concat(item.surfaces).includes("sidebar"));
+    const rows = sessionRows();
+    for (const info of rows) {
+      const host = ensureHost(info.controls, "row-actions", fingerprint(actions, info.sessionId), "span", (node) => info.controls.insertBefore(node, info.controls.firstElementChild));
+      if (!host) continue;
+      for (const action of actions) {
+        const button = cloneIconButton(info.sample, resolveText(action.label), action.icon);
+        button.setAttribute(EXT_ATTR, action.scriptKey || "runtime");
+        if (action.className) button.className += ` ${action.className}`;
+        if (typeof action.onMount === "function") runCallback(action.scriptKey, `rowAction.onMount:${action.id}`, () => action.onMount({ button, row: info.row, session_id: info.sessionId }));
+        onActivate(button, (event) => {
+          event.stopPropagation();
+          const context = {
+            row: info.row, session_id: info.sessionId, title: info.title, archived: false, button, event, close() {},
+            resolve: () => Promise.resolve({ session_id: info.sessionId, title: info.title }),
+          };
+          if (typeof action.onActivate === "function") runCallback(action.scriptKey, `rowAction:${action.id}`, () => action.onActivate(context));
+        });
+        host.append(button);
+      }
+    }
+    if (actions.length && rows.length) setMount("rows", true);
+  }
+
+  // ---- 右侧面板：registerSidePanel
+  let openPanel = null;
+  function closeSidePanel() {
+    const panel = openPanel;
+    if (!panel) return false;
+    openPanel = null;
+    if (typeof panel.cleanup === "function") runCallback(panel.scriptKey, "sidePanel.cleanup", panel.cleanup);
+    panel.node.remove();
+    const pane = find("pane");
+    if (pane) pane.style.marginInlineEnd = "";
+    refreshHosts();
+    return true;
+  }
+  function openSidePanel(id) {
+    const definition = registry.sidePanels.get(id);
+    if (!definition) return false;
+    closeSidePanel();
+    const width = Math.min(720, Math.max(240, Number(definition.width) || 360));
+    const body = el("div", { class: "codex-plus-panel-body", [EXT_ATTR]: definition.scriptKey || "runtime" });
+    const close = el("button", { type: "button", class: "codex-plus-page-close", "aria-label": ui("关闭", "Close"), text: "✕" });
+    const node = own(el("aside", { "aria-label": resolveText(definition.title) }, [
+      el("div", { class: "codex-plus-page-head" }, [el("div", { class: "codex-plus-page-title", text: resolveText(definition.title) }), close]),
+      body,
+    ]), "side-panel");
+    node.style.width = `${width}px`;
+    close.addEventListener("click", closeSidePanel);
+    document.body.append(node);
+    // 主区域让出面板的宽度（面板自己是固定定位，不进 Claude 的布局）。
+    const pane = find("pane");
+    if (pane) pane.style.marginInlineEnd = `${width}px`;
+    openPanel = { id, node, scriptKey: definition.scriptKey, cleanup: null };
+    const result = runCallback(definition.scriptKey, `sidePanel:${id}`, () => definition.render({ container: body, close: closeSidePanel }));
+    if (result.ok && typeof result.value === "function" && openPanel) openPanel.cleanup = result.value;
+    refreshHosts();
+    return true;
+  }
+  function registerSidePanel(definition, options = {}) {
+    const scriptKey = currentScriptKey(options);
+    const id = `${scriptKey}:sidePanel:${options.id || `item-${(idCounter += 1)}`}`;
+    const dispose = registerInto("sidePanel", registry.sidePanels, id, definition, scriptKey);
+    refreshHosts();
+    const handle = () => {
+      if (openPanel?.id === id) closeSidePanel();
+      dispose();
+      refreshHosts();
+    };
+    handle.open = () => openSidePanel(id);
+    handle.close = () => (openPanel?.id === id ? closeSidePanel() : false);
+    handle.toggle = () => (openPanel?.id === id ? closeSidePanel() : openSidePanel(id));
+    return handle;
+  }
+  /** 面板的开关按钮放在对话页头部的按钮组里；没有头部的页面（新对话）上放进悬浮球的页签旁边由句柄打开。 */
+  function refreshSidePanelToggles() {
+    const panels = itemsOf(registry.sidePanels);
+    if (openPanel && !registry.sidePanels.has(openPanel.id)) closeSidePanel();
+    const group = find("headerActions");
+    if (!group) return;
+    const host = ensureHost(group, "side-panel-toggles", fingerprint(panels, openPanel?.id || ""), "span", (node) => group.append(node));
+    if (host) {
+      for (const panel of panels) {
+        const icon = iconNode(panel.icon, "▤");
+        const button = el("button", { type: "button", class: "codex-plus-toggle", "aria-label": resolveText(panel.title), title: resolveText(panel.title), "aria-pressed": String(openPanel?.id === panel.id), [EXT_ATTR]: panel.scriptKey || "runtime" }, [icon]);
+        button.addEventListener("click", () => (openPanel?.id === panel.id ? closeSidePanel() : openSidePanel(panel.id)));
+        host.append(button);
+      }
+    }
+    if (panels.length) setMount("sidePanel", true);
+  }
+
+  // ---- 「拓展」页：设置面板、设置分区和菜单项的去处
+  // Claude 里没有 Codex++ 的菜单和拓展详情页，registerSettingsPanel / registerSettingsSection / registerMenuItem
+  // 登记的东西集中放在运行时自带的这一页里（有登记项时才出现入口）。
+  const BUILTIN_KEY = "builtin:runtime";
+  const BUILTIN_PAGE = `${BUILTIN_KEY}:page:extensions`;
+  function renderExtensionsPage({ container }) {
+    const cleanups = [];
+    const section = (title) => {
+      const body = el("div", { class: "codex-plus-ext-section-body" });
+      container.append(el("section", { class: "codex-plus-ext-section" }, [el("h3", { text: title }), body]));
+      return body;
+    };
+    const nameOf = (scriptKey) => state.scripts[scriptKey]?.name || scriptKey;
+    const menuItems = itemsOf(registry.menuItems);
+    if (menuItems.length) {
+      const body = section(ui("开关与操作", "Switches and actions"));
+      for (const item of menuItems) {
+        const label = resolveText(item.label) || item.id;
+        const control = typeof item.onChange === "function"
+          ? el("input", { type: "checkbox", "aria-label": label })
+          : el("button", { type: "button", class: "codex-plus-button", text: resolveText(item.buttonLabel) || ui("打开", "Open") });
+        if (control.tagName === "INPUT") {
+          const current = typeof item.toggleValue === "function" ? runCallback(item.scriptKey, "menuItem.toggleValue", () => item.toggleValue()) : { ok: false };
+          control.checked = current.ok && current.value === true;
+          control.addEventListener("change", () => runCallback(item.scriptKey, `menuItem:${item.id}`, () => item.onChange(control.checked)));
+        } else {
+          control.addEventListener("click", () => runCallback(item.scriptKey, `menuItem:${item.id}`, () => item.onActivate({ close: closePage })));
+        }
+        body.append(el("label", { class: "codex-plus-ext-row" }, [
+          el("span", {}, [el("strong", { text: label }), item.description ? el("small", { text: resolveText(item.description) }) : null]),
+          control,
+        ]));
+      }
+    }
+    const render = (item, label, context) => {
+      const holder = el("div", { [EXT_ATTR]: item.scriptKey || "runtime" });
+      section(label).append(holder);
+      const result = runCallback(item.scriptKey, `${item.kind}:${item.id}`, () => item.render({ container: holder, ...context }));
+      if (result.ok && typeof result.value === "function") cleanups.push(() => runCallback(item.scriptKey, `${item.kind}.cleanup`, result.value));
+    };
+    for (const item of itemsOf(registry.settingsSections)) render(item, resolveText(item.title), { close: closePage });
+    for (const item of itemsOf(registry.settingsPanels)) {
+      const config = extensionManifest(item.scriptKey)?.config ?? {};
+      // 在页面里改配置还没接上：给出明确的原因，不假装保存成功。
+      const saveConfig = (values) => request("config", { key: item.scriptKey, values: values ?? {} });
+      render(item, nameOf(item.scriptKey), { config, saveConfig });
+    }
+    return () => cleanups.forEach((cleanup) => cleanup());
+  }
+  function refreshExtensionsPage() {
+    const wanted = registry.menuItems.size + registry.settingsPanels.size + registry.settingsSections.size > 0;
+    const present = registry.pages.has(BUILTIN_PAGE);
+    if (wanted === present) return;
+    if (wanted) {
+      const page = { title: ui("拓展", "Extensions"), icon: "✦", render: renderExtensionsPage };
+      registerInto("page", registry.pages, BUILTIN_PAGE, page, BUILTIN_KEY);
+      registerInto("navEntry", registry.navEntries, `${BUILTIN_KEY}:navEntry:extensions`, { ...page, label: page.title, pageId: BUILTIN_PAGE }, BUILTIN_KEY);
+    } else {
+      registry.pages.delete(BUILTIN_PAGE);
+      registry.navEntries.delete(`${BUILTIN_KEY}:navEntry:extensions`);
+    }
+  }
+
+  installStyle("runtime-hosts", `
+    [${OWN_ATTR}="rail"]{display:flex;flex-direction:column}
+    [${OWN_ATTR}="rail-entry"]{cursor:pointer}
+    [${OWN_ATTR}="rail-entry"] .codex-plus-icon{width:20px;height:20px;font-size:15px}
+    [${OWN_ATTR}="composer-actions"],[${OWN_ATTR}="message-actions"],[${OWN_ATTR}="row-actions"],[${OWN_ATTR}="side-panel-toggles"]{display:inline-flex;align-items:center;gap:2px;pointer-events:auto}
+    [${OWN_ATTR}="composer-actions"] .codex-plus-icon{width:20px;height:20px;font-size:15px}
+    [${OWN_ATTR}^="slot:"]:empty,[${OWN_ATTR}="message-decorations"]:empty{display:none}
+    [${OWN_ATTR}="slot:overlay"]{position:fixed;inset:0;z-index:2147483500;pointer-events:none}
+    [${OWN_ATTR}="hints"]{position:fixed;z-index:2147483640;display:flex;flex-direction:column;gap:2px;max-height:min(360px,50vh);overflow:auto;padding:6px;border-radius:12px;font-size:13px;
+      background:hsl(var(--bg-000,0 0% 100%));color:hsl(var(--text-100,60 2.6% 7.6%));border:1px solid hsl(var(--border-300,30 3.3% 11.8%)/.15);box-shadow:0 8px 24px hsl(0 0% 0%/.2)}
+    .codex-plus-hint{display:flex;align-items:baseline;gap:10px;padding:6px 8px;border:0;border-radius:8px;background:transparent;color:inherit;cursor:pointer;font:inherit;text-align:left}
+    .codex-plus-hint span{color:hsl(var(--text-400,51 3.1% 43.7%))}
+    .codex-plus-hint[aria-selected="true"],.codex-plus-hint:hover{background:var(--df-hover,hsl(var(--bg-300,48 25% 92.2%)))}
+    .codex-plus-toggle{width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:8px;background:transparent;color:inherit;cursor:pointer}
+    .codex-plus-toggle:hover,.codex-plus-toggle[aria-pressed="true"]{background:var(--df-hover,hsl(var(--bg-300,48 25% 92.2%)))}
+    [${OWN_ATTR}="side-panel"]{position:fixed;top:0;right:0;bottom:0;z-index:2147483400;display:flex;flex-direction:column;font-size:14px;
+      background:hsl(var(--bg-100,48 33.3% 97.1%));color:hsl(var(--text-100,60 2.6% 7.6%));border-left:1px solid hsl(var(--border-300,30 3.3% 11.8%)/.12)}
+    .codex-plus-panel-body{flex:1;min-height:0;overflow:auto}
+    .codex-plus-ext-section{max-width:720px;margin:0 auto;padding:16px 20px 0}
+    .codex-plus-ext-section h3{margin:0 0 8px;font-size:13px;font-weight:600;color:hsl(var(--text-300,60 2.5% 23.3%))}
+    .codex-plus-ext-section-body{display:flex;flex-direction:column;border-radius:12px;background:hsl(var(--bg-000,0 0% 100%));border:1px solid hsl(var(--border-300,30 3.3% 11.8%)/.12)}
+    .codex-plus-ext-section-body > [${EXT_ATTR}]{padding:12px 14px}
+    .codex-plus-ext-row{display:flex;align-items:center;gap:12px;padding:10px 14px}
+    .codex-plus-ext-row + .codex-plus-ext-row{border-top:1px solid hsl(var(--border-300,30 3.3% 11.8%)/.1)}
+    .codex-plus-ext-row > span{flex:1;min-width:0;display:flex;flex-direction:column}
+    .codex-plus-ext-row small{color:hsl(var(--text-400,51 3.1% 43.7%))}
+    .codex-plus-button{padding:5px 12px;border-radius:8px;border:1px solid hsl(var(--border-300,30 3.3% 11.8%)/.25);background:transparent;color:inherit;cursor:pointer;font:inherit}
+    .codex-plus-button:hover{background:var(--df-hover,hsl(var(--bg-300,48 25% 92.2%)))}
+  `);
+
+  // 重画的顺序：「拓展」页的入口先定下来，侧栏入口才画得全。
+  for (const refresh of [refreshExtensionsPage, refreshRail, refreshComposerActions, refreshMessages, refreshSlots, refreshRowActions, refreshSidePanelToggles]) {
+    hostRefreshers.add(refresh);
+  }
+  // Claude 的界面变了（切会话、侧栏重建、消息流式输出）就按注册表重画一遍；各函数按指纹幂等。
+  registerScanStep(refreshHostsNow, "deferred");
+
+  for (const name of [
+    "registerComposerAction", "registerCommand", "registerInputTrigger", "registerMessageAction", "registerMessageDecoration",
+    "registerRowAction", "registerSidePanel", "registerSlot", "registerMenuItem", "registerSettingsPanel", "registerSettingsSection",
+  ]) {
+    mountSupport.set(name, () => true);
+  }
+  for (const name of [...Object.keys(slotPlaces), "turn.after", "sessionRow.suffix"]) mountSupport.set(`registerSlot:${name}`, () => true);
+
   // ------------------------------------------------------------------ 调后端路由
   function extensionManifest(scriptKey) {
     const manifest = state.scripts[scriptKey]?.manifest;
@@ -1556,17 +2281,22 @@
     registerMenuItem: (definition, options = {}) => registerItem("menuItem", registry.menuItems, "registerMenuItem", definition, options),
     registerSettingsPanel: (definition, options = {}) => registerItem("settingsPanel", registry.settingsPanels, "registerSettingsPanel", definition, options),
     registerSettingsSection: (definition, options = {}) => registerItem("settingsSection", registry.settingsSections, "registerSettingsSection", definition, options),
-    registerCommand: (definition, options = {}) => registerItem("command", registry.commands, "registerCommand", definition, options),
+    registerCommand,
     registerComposerAction: (definition, options = {}) => registerItem("composerAction", registry.composerActions, "registerComposerAction", definition, options),
-    registerInputTrigger: (definition, options = {}) => registerItem("inputTrigger", registry.inputTriggers, "registerInputTrigger", definition, options),
+    registerInputTrigger,
     registerMessageAction: (definition, options = {}) => registerItem("messageAction", registry.messageActions, "registerMessageAction", definition, options),
     registerMessageDecoration: (definition, options = {}) => registerItem("messageDecoration", registry.messageDecorations, "registerMessageDecoration", definition, options),
     registerRowAction: (definition, options = {}) => registerItem("rowAction", registry.rowActions, "registerRowAction", definition, options),
-    registerSlot: (definition, options = {}) =>
-      registerWithHandle("slot", registry.slots, `registerSlot:${String(definition?.slot || "")}`, definition, options, { refresh: refreshHostsNow }),
+    registerSlot: (definition, options = {}) => {
+      // 强制重画：把这个位置上的容器指纹作废，下一轮按注册表重建。
+      const refresh = () => {
+        for (const node of document.querySelectorAll(`[${OWN_ATTR}^="slot:"]`)) node.setAttribute("data-fp", "stale");
+        refreshHostsNow();
+      };
+      return registerWithHandle("slot", registry.slots, `registerSlot:${String(definition?.slot || "")}`, definition, options, { refresh });
+    },
     registerToolView: (definition, options = {}) => registerWithHandle("toolView", registry.toolViews, "registerToolView", definition, options, { refresh: refreshHostsNow }),
-    registerSidePanel: (definition, options = {}) =>
-      registerWithHandle("sidePanel", registry.sidePanels, "registerSidePanel", definition, options, { open: () => false, close: () => false, toggle: () => false }),
+    registerSidePanel,
     onCleanup(cleanup) {
       return state.registerCleanup(cleanup);
     },

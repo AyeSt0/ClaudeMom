@@ -486,6 +486,27 @@ MFA 仅提供本地模拟账号的 GET 状态，不修改真实账号的双重�
 - `/__codex_plus/pkg/<slug>.js`：每个拓展包一个脚本，由 `page-wrap.js` 包装。一个包语法错误或抛错只影响它自己。
 - 两者都带 `defer` 插在官方脚本之前，只回应同源请求（`Sec-Fetch-Site: same-origin`）。
 
+### 挂载点
+
+拓展登记的界面项由运行时画到 Claude 页面上。不依赖 Claude DOM 的（提示、确认框、整页页面、悬浮页签、快捷键、主题、`overlay` 插槽）任何页面都可用；其余的挂在 Claude 自己的 DOM 上，位置写在锚点表 `page-anchors.js` 里：
+
+| 接口 | 挂在哪 |
+| --- | --- |
+| `registerPage` / `registerNavEntry` | 侧栏「项目 / Artifacts / 插件」那组导航行后面；找不到时退到右下角的悬浮按钮里 |
+| `registerComposerAction` | 输入框工具行左边，挨着加号 |
+| `registerCommand` / `registerInputTrigger` | 输入框：回车时拦下「/名字 参数」；光标前是触发符时弹出候选 |
+| `registerMessageAction` / `registerMessageDecoration` | 每条消息的操作行里（时间戳前面）；回复正文和操作行之间、用户消息气泡下面 |
+| `registerSlot` | `composer.above` / `composer.below`、`thread.top` / `thread.bottom`、`turn.after`、`sidebar.top` / `sidebar.bottom`、`titlebar`、`sessionRow.suffix`、`overlay` |
+| `registerRowAction` | 最近对话列表每一行「更多选项」旁边 |
+| `registerSidePanel` | 开关在对话页头部的按钮组里；面板固定在右侧，主区域让出它的宽度 |
+| `registerMenuItem` / `registerSettingsSection` / `registerSettingsPanel` | 运行时自带的「拓展」页（有登记项时侧栏出现入口） |
+
+按钮和侧栏行是克隆旁边的原生控件再换图标和文字，所以样子跟着 Claude 走。每个宿主按「登记了哪些项」算指纹，没变就不动 DOM；自己插的节点带 `data-codex-plus-claude`，交给拓展画的容器带 `data-codex-plus-ext`，扫描靠这两个属性认出自己的写入。锚点找不到时那一处不出现，并随 `status` 回报「没挂上」，拓展的其余部分照常工作。
+
+还没有位置的：`registerToolView`（工具调用块没量过），以及 `registerSlot` 的 `composer.left` / `composer.right` / `composer.model`、`home.above`、`settings.nav`、`activity.after`、`approval`、`header.title`、`sidebar.section`、`sessionRow.prefix`、`projectRow.suffix`。登记它们不报错、不出现，`codexPlus.supports()` 对它们回 `false`。
+
+锚点是对着录制版界面的 Chat 页签量的（见 `dev/README.md`）；Cowork、Code 页签和本机版界面还没量过，那里只有不依赖 DOM 的部分保证可用。
+
 ### 页面调后台
 
 `POST /__codex_plus/api/v1/<op>`，请求体和回应都是 JSON，回应是 `{ "ok": true, "result": … }` 或 `{ "ok": false, "error": "…", "code": "…" }`。

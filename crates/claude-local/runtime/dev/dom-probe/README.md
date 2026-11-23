@@ -2,7 +2,7 @@
 
 拓展的挂载点（输入框按钮、消息操作、侧栏入口、设置分区……）要挂在 Claude 页面的具体位置上，这些位置写在
 `runtime/page-anchors.js` 里。Claude 改版后锚点可能失效，要重新量一遍：这个拓展包把页面的结构和原生控件的
-计算样式存成文件，照着它改锚点表，并把样本放进 `runtime/fixtures/dom/` 给 `page-anchors.test.mjs` 用。
+计算样式存成文件，照着它改锚点表，锚点测试用的样本（`runtime/fixtures/dom/`）用 `dev/export-dom.js` 导出。
 
 它只记结构和样式：标签、`data-testid`、`role`、`aria-label`、类名、属性名、位置大小、计算样式。不记文字内容；
 属性值只记形状（`<uuid>`、`<number>`、短标识），地址里的会话 id 换成 `:uuid`。
