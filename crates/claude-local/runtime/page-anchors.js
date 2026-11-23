@@ -6,7 +6,7 @@
 //
 // 选择器优先用 data-testid：它们是 Claude 前端自己的测试标识，比类名稳定。只写简单的形式
 //（标签、.类、[属性="值"]、逗号分隔），位置关系（公共祖先、兄弟）由运行时按结构推出来，不写在这里。
-// 2026-11-24 对着录制版界面（build 0f183c1216 / a4ced7f85b）的 Chat 页签量的；量法见 dev/README.md。
+// 2026-11-24 对着录制版界面（build a4ced7f85b）量的，合并式主页（B 版）和经典主页（A 版）两种布局都量过；量法见 dev/README.md。
 window.__codexPlusClaudeAnchors = {
   version: 2,
   // 侧栏
@@ -21,8 +21,8 @@ window.__codexPlusClaudeAnchors = {
   composerEditor: ['[data-testid="chat-input"]', '[data-testid="code-prompt-input"]'],
   /** 工具行左边的原生按钮（加号）：拓展的输入框按钮挨着它放，样子照它。 */
   composerLeading: ['[data-testid="chat-input-attach"]'],
-  /** 工具行右边的任意一个原生控件：和上面那个的公共祖先就是工具行。 */
-  composerTrailing: ['[data-testid="chat-input-send"]', '[data-testid="composer-dictate"]', '[data-testid="model-selector-dropdown"]'],
+  /** 输入区里别的原生控件：拓展的按钮只和加号一组，不混进它们那一组。 */
+  composerTrailing: ['[data-testid="chat-input-send"]', '[data-testid="composer-dictate"]', '[data-testid="chin-mic"]', '[data-testid="model-selector-dropdown"]'],
   /** 整个输入框的外框（从工具行往上找）：composer.above / below 放在它的前后。 */
   composerBox: [".font-sans.flex-col", "fieldset", "form"],
   // 对话

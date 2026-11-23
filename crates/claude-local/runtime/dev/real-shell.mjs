@@ -1,6 +1,9 @@
 // 开发用：在隔离的 Chrome 里打开录制版 Claude 界面，带上拓展运行时和指定的拓展包。
 //
-//   node dev/real-shell.mjs [拓展包目录...] [--installed <已安装的 claude-local 目录>] [--cdp 9377] [--headful]
+//   node dev/real-shell.mjs [拓展包目录...] [--installed <已安装的 claude-local 目录>] [--cdp 9377] [--headful] [--classic]
+//
+// 录制模板的账号在「合并式主页」的实验组里（对话和 Cowork 合在一个输入框，B 版）；默认就按 B 版打开，
+// 加 --classic 是有「Chat | Cowork | Code」切换的经典主页（A 版，设置里没开合并式主页时用户看到的）。两种都要量。
 //
 // 用来在真实的 Claude 前端上量 DOM、验证注入（CSP、执行时机），不碰正在用的 Claude Desktop 和它的配置：
 // - 本地服务从本仓库的 runtime/ 起一份新的，状态文件、扩展目录、注入计划都在临时目录里；
@@ -94,6 +97,8 @@ const proxy = spawn(process.execPath, [path.join(service, "proxy.mjs"), "--port"
     CLAUDE_LOCAL_VOICE_INPUT: "0",
     CLAUDE_LOCAL_COMPUTER_USE: "0",
     CLAUDE_LOCAL_BACKGROUND_MODE: "0",
+    CLAUDE_LOCAL_COWORK: "1",
+    CLAUDE_LOCAL_HUB_HOME: args.includes("--classic") ? "0" : "1",
     CLAUDE_LOCAL_EXTENSIONS_DIR: path.join(root, "extensions"),
     CLAUDE_LOCAL_EXTENSIONS_STATE: path.join(root, "extensions.json"),
     CLAUDE_LOCAL_PAGE_PLAN: planFile,

@@ -16,6 +16,11 @@
 1. `node dev/real-shell.mjs dev/dom-probe`，等它打印出端口。
 2. `node dev/cdp.mjs shot /tmp/a.png` 看一眼页面；`node dev/cdp.mjs eval '<表达式>'` 查结构。要对话页就在页面里发一条消息（假上游会回一段固定文字）。
 3. 改 `page-anchors.js`。改完给 `real-shell.mjs` 的进程发 `SIGHUP`（重新生成注入计划），再 `node dev/cdp.mjs reload`。
-4. 导出新样本：`node dev/cdp.mjs file dev/export-dom.js > fixtures/dom/chat-conversation.json`（新对话页是 `chat-new.json`），跑 `node --test page-runtime.test.mjs`。哪条断言挂了，就是哪个锚点还没对上。
+4. 导出新样本：`node dev/cdp.mjs file dev/export-dom.js > fixtures/dom/hub-conversation.json`（新对话页是 `hub-new.json`），跑 `node --test page-runtime.test.mjs`。哪条断言挂了，就是哪个锚点还没对上。
 
-现有的锚点和样本是 2026-11-24 对着录制版界面（build `a4ced7f85b`）的 Chat 页签量的。Cowork、Code 页签依赖桌面端的宿主接口，在 Chrome 里起不来，还没量过；本机版界面（`app://localhost`）也没量过。
+录制模板的账号在界面实验里，有两种布局，两种都要量、都有样本：
+
+- **合并式主页（B 版，`hub-*.json`）**：`real-shell.mjs` 默认打开的就是它。对话页的加号、麦克风、模型选择器在输入框下面单独一条里。
+- **经典主页（A 版，`classic-*.json`）**：加 `--classic`。有「Chat | Cowork | Code」切换，加号在输入框里面的工具行左边。设置里没开「合并式主页」时用户看到的是这一种。
+
+现有的锚点和样本是 2026-11-24 对着录制版界面（build `a4ced7f85b`）的对话页签量的。Cowork、Code 页签依赖桌面端的宿主接口，在 Chrome 里起不来，还没量过；本机版界面（`app://localhost`）也没量过。

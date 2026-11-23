@@ -568,6 +568,9 @@ test("the current session id comes from the address", () => {
 // ---------------------------------------------------------------- 挂在 Claude 界面上的位置
 // 页面结构是真实 Claude 页面导出的样本（fixtures/dom/，用 dev/export-dom.js 导出）。Claude 改版后重新导出一份，
 // 这里哪条断言挂了，就是哪个锚点要改（page-anchors.js）。
+// 录制模板的账号在界面实验里，两种布局都有人用，都要过：hub 是合并式主页（B 版，对话页的加号在输入框下面那一条里），
+// classic 是有「Chat | Cowork | Code」切换的经典主页（A 版，加号在输入框里面的工具行左边）。
+const LAYOUTS = ["hub", "classic"];
 
 /** 每个挂载点各登记一项的拓展。 */
 const TOUR = `
@@ -588,8 +591,8 @@ const host = (page, name) => page.documentElement.querySelectorAll(`[data-codex-
 const byTestId = (page, id) => page.documentElement.querySelector(`[data-testid="${id}"]`);
 const before = (node, other) => node.parentElement === other.parentElement && node.parentElement.children.indexOf(node) < other.parentElement.children.indexOf(other);
 
-test("on a real chat page every mount point lands next to its native counterpart", () => {
-  const page = createPage({ fixture: "chat-conversation", pathname: "/chat/00000000-0000-4000-8000-000000000001" });
+for (const layout of LAYOUTS) test(`on a real chat page (${layout}) every mount point lands next to its native counterpart`, () => {
+  const page = createPage({ fixture: `${layout}-conversation`, pathname: "/chat/00000000-0000-4000-8000-000000000001" });
   page.runPackage("local:tour", TOUR);
   const { window } = page;
 
@@ -614,7 +617,11 @@ test("on a real chat page every mount point lands next to its native counterpart
   // 输入框按钮：在工具行左边那一组里，照原生的加号按钮克隆。
   const attach = byTestId(page, "chat-input-attach");
   const actions = host(page, "composer-actions")[0];
-  assert.ok(actions.parentElement.contains(attach) && !actions.parentElement.contains(byTestId(page, "composer-dictate")), "和加号同一组，不在右边那一组");
+  assert.ok(actions.parentElement.contains(attach), "和加号同一组");
+  for (const other of ["chat-input", "chat-input-send", "composer-dictate", "chin-mic", "model-selector-dropdown"]) {
+    const native = byTestId(page, other);
+    if (native) assert.equal(actions.parentElement.contains(native), false, `不和 ${other} 混在一组`);
+  }
   const composerButton = actions.querySelector("button");
   assert.equal(composerButton.className, attach.className);
   assert.deepEqual([composerButton.getAttribute("aria-label"), composerButton.hasAttribute("data-testid")], ["插入时间", false]);
@@ -689,8 +696,8 @@ test("on a real chat page every mount point lands next to its native counterpart
   assert.ok(window.tour.some(([kind, name]) => kind === "slot-cleanup" && name === "thread.top"));
 });
 
-test("on the new-chat page the places that exist are used and the rest wait quietly", () => {
-  const page = createPage({ fixture: "chat-new" });
+for (const layout of LAYOUTS) test(`on the new-chat page (${layout}) the places that exist are used and the rest wait quietly`, () => {
+  const page = createPage({ fixture: `${layout}-new` });
   page.runPackage("local:tour", TOUR);
   for (const name of ["rail", "composer-actions", "slot:composer.above", "slot:sidebar.top", "slot:sidebar.bottom"]) assert.equal(host(page, name).length, 1, name);
   // 新对话页没有对话区、没有头部按钮组：这些位置不出现，也不算「没挂上」。
@@ -718,7 +725,7 @@ test("when Claude's markup no longer matches, nothing throws and the missing pla
 });
 
 test("slash commands run instead of being sent, and input triggers offer choices", async () => {
-  const page = createPage({ fixture: "chat-new" });
+  const page = createPage({ fixture: "hub-new" });
   page.runPackage("local:demo", `
     codexPlus.extension((ctx) => {
       ctx.registerCommand({ name: "tour", description: "全览", run(args, { sessionId, setText, toast }) { window.ran = [args, sessionId]; toast("收到 " + args); } });
@@ -762,7 +769,7 @@ test("slash commands run instead of being sent, and input triggers offer choices
 });
 
 test("settings panels, settings sections and menu items get a page of their own", () => {
-  const page = createPage({ fixture: "chat-new" });
+  const page = createPage({ fixture: "hub-new" });
   assert.equal(host(page, "rail").length, 0, "没有登记项时不出现入口");
   page.runPackage("local:demo", `
     window.instance = codexPlus.extension((ctx) => {

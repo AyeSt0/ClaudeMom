@@ -1204,22 +1204,27 @@
   // ---- 输入框
   const editorSelector = () => anchorList("composerEditor").join(", ");
   const composerEditorFrom = (target) => (editorSelector() && target?.closest ? target.closest(editorSelector()) : null);
-  /** 输入区的几个部件：编辑器、工具行、左边那一组、外框。找不全返回 null。 */
+  /**
+   * 输入区的几个部件：编辑器、加号按钮、加号所在的那一组、整个输入框的外框。找不全返回 null。
+   * 「那一组」是加号往上、既不含编辑器也不含别的原生控件的最高一层。Claude 有两种布局都要认：
+   * 首页是工具行在输入框里面（加号在左边一组、麦克风等在右边一组）；对话页（合并式主页）是输入框下面单独一条，
+   * 加号、麦克风、模型选择器都在那一条里。
+   */
   function composerParts() {
     const editor = find("composerEditor");
     const leading = find("composerLeading");
-    const trailing = find("composerTrailing");
-    if (!editor || !leading || !trailing) return null;
-    const row = lca(leading, trailing);
-    const group = row && childOf(row, leading);
-    if (!row || !group || row.contains(editor)) return null;
-    const inner = lca(editor, row);
+    if (!editor || !leading) return null;
+    const others = anchorList("composerTrailing").map((selector) => document.querySelector(selector)).filter(Boolean);
+    let group = null;
+    for (let node = leading.parentElement; node && !node.contains(editor) && !others.some((other) => node.contains(other)); node = node.parentElement) group = node;
+    if (!group) return null;
+    const inner = lca(editor, group);
     let box = null;
     for (const selector of anchorList("composerBox")) {
       box = inner?.closest(selector) || null;
       if (box) break;
     }
-    return { editor, leading, row, group, box: box || inner?.parentElement || inner };
+    return { editor, leading, group, box: box || inner?.parentElement || inner };
   }
   /** 往输入框光标处写字。Claude 的输入框是富文本编辑器，直接改 DOM 会被它盖掉，要走它认的输入命令。 */
   function insertIntoEditor(editor, text) {

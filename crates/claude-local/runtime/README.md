@@ -505,7 +505,7 @@ MFA 仅提供本地模拟账号的 GET 状态，不修改真实账号的双重�
 
 还没有位置的：`registerToolView`（工具调用块没量过），以及 `registerSlot` 的 `composer.left` / `composer.right` / `composer.model`、`home.above`、`settings.nav`、`activity.after`、`approval`、`header.title`、`sidebar.section`、`sessionRow.prefix`、`projectRow.suffix`。登记它们不报错、不出现，`codexPlus.supports()` 对它们回 `false`。
 
-锚点是对着录制版界面的 Chat 页签量的（见 `dev/README.md`）；Cowork、Code 页签和本机版界面还没量过，那里只有不依赖 DOM 的部分保证可用。
+锚点是对着录制版界面的对话页签量的，合并式主页（B 版）和经典主页（A 版）两种布局都量过（见 `dev/README.md`）；Cowork、Code 页签和本机版界面还没量过，那里只有不依赖 DOM 的部分保证可用。
 
 ### 页面调后台
 
