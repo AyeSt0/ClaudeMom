@@ -62,7 +62,33 @@ export type ClaudeConfig = {
   importCliSessions?: boolean;
 };
 
-/** 页面扩展（与 core `extensions::ExtensionInfo` 一致）。 */
+/** 多语言文本：字符串，或 `{ en, zh, ... }`。 */
+export type LocalizedText = string | Record<string, string>;
+
+/** 拓展包声明的一个配置项（与 core `extensions::config::ExtensionConfigField` 一致）。 */
+export type ExtensionConfigField = {
+  key: string;
+  type: "string" | "text" | "number" | "boolean" | "select" | "array" | "object";
+  title: LocalizedText;
+  description: LocalizedText;
+  default: unknown;
+  options: Array<{ value: unknown; label: string }>;
+  /** 按密码框显示；读回来的值是打码的。 */
+  secret: boolean;
+  min?: number;
+  max?: number;
+};
+
+/** 页面上次加载一个拓展包的结果（页面运行时回报的）。 */
+export type ExtensionRuntime = {
+  status: "pending" | "loading" | "loaded" | "failed";
+  error: string;
+  /** 它用了、但在 Claude 里还没有的接口。 */
+  unsupported: string[];
+  loadedAt: string;
+};
+
+/** 页面扩展 / 拓展包（与 core `extensions::ExtensionInfo` 一致）。 */
 export type ExtensionInfo = {
   id: string;
   name: string;
@@ -73,7 +99,93 @@ export type ExtensionInfo = {
   enabled: boolean;
   /** 清单有问题时的原因：这样的扩展不会生效，也不能启用。 */
   error: string | null;
+  /** manifest：页面扩展（js / css）；codexpp：Codex++ 拓展包（带页面接口、配置、后台）。 */
+  format: "manifest" | "codexpp";
+  /** page / styles / backend / mods / codexOnly */
+  capabilities: string[];
+  notes: string[];
+  configSchema: ExtensionConfigField[];
+  /** 生效配置，密钥项已打码；没有配置项时为 null。 */
+  config: Record<string, unknown> | null;
+  runtime: ExtensionRuntime | null;
 };
+
+/** 密钥项读回来的打码值；原样传回去表示不改。 */
+export const SECRET_MASK = "******";
+
+/** 取多语言文本：先中文，再英文，再随便一个。 */
+export function localizedText(text: LocalizedText | null | undefined): string {
+  if (text == null) return "";
+  if (typeof text === "string") return text;
+  const pick = Object.keys(text).find((key) => /^zh/i.test(key)) ?? Object.keys(text).find((key) => /^en/i.test(key)) ?? Object.keys(text)[0];
+  return pick ? String(text[pick]) : "";
+}
+
+/** 一个拓展包在 Claude 页面里的运行情况，给列表里那一行用；页面扩展、没启用的不显示。 */
+export function extensionRuntimeNote(item: ExtensionInfo): { tone: "ok" | "error" | "muted"; text: string } | null {
+  if (item.format !== "codexpp" || !item.enabled || item.error) return null;
+  const runtime = item.runtime;
+  if (!runtime || runtime.status === "pending" || runtime.status === "loading") {
+    return { tone: "muted", text: "还没在 Claude 页面里运行过：刷新 Claude 页面后生效" };
+  }
+  const firstLine = (text: string) => text.split("\n")[0].slice(0, 300);
+  if (runtime.status === "failed") return { tone: "error", text: `加载失败：${firstLine(runtime.error) || "脚本没有执行"}` };
+  if (runtime.error) return { tone: "error", text: `已加载，运行中出错：${firstLine(runtime.error)}` };
+  if (runtime.unsupported.length) return { tone: "muted", text: `已加载；这些接口在 Claude 里还不可用：${runtime.unsupported.join("、")}` };
+  return { tone: "ok", text: "已加载" };
+}
+
+/** 配置项在输入框里的文字。 */
+export function configInputText(field: ExtensionConfigField, value: unknown): string {
+  if (field.type === "array" || field.type === "object") return JSON.stringify(value ?? (field.type === "array" ? [] : {}), null, 2);
+  return value == null ? "" : String(value);
+}
+
+/** 把输入框里的文字变回配置值；写得不对时返回原因。 */
+export function parseConfigInput(field: ExtensionConfigField, text: string): { value: unknown } | { error: string } {
+  const title = localizedText(field.title) || field.key;
+  switch (field.type) {
+    case "number": {
+      const value = Number(text);
+      if (text.trim() === "" || !Number.isFinite(value)) return { error: `「${title}」要填数字` };
+      if (field.min != null && value < field.min) return { error: `「${title}」不能小于 ${field.min}` };
+      if (field.max != null && value > field.max) return { error: `「${title}」不能大于 ${field.max}` };
+      return { value };
+    }
+    case "boolean":
+      return { value: text === "true" };
+    case "select": {
+      const option = field.options.find((item) => String(item.value) === text);
+      return option ? { value: option.value } : { error: `「${title}」要从给出的选项里选` };
+    }
+    case "array":
+    case "object":
+      try {
+        const value: unknown = JSON.parse(text);
+        const isArray = Array.isArray(value);
+        if (field.type === "array" ? !isArray : isArray || value === null || typeof value !== "object") {
+          return { error: `「${title}」要填 JSON ${field.type === "array" ? "数组" : "对象"}` };
+        }
+        return { value };
+      } catch {
+        return { error: `「${title}」不是合法的 JSON` };
+      }
+    default:
+      return { value: text };
+  }
+}
+
+/** 整张配置表单要保存的值；有一项写得不对就返回那一项的原因。 */
+export function configValues(schema: ExtensionConfigField[], draft: Record<string, string>): { values: Record<string, unknown> } | { error: string } {
+  const values: Record<string, unknown> = {};
+  for (const field of schema) {
+    if (!(field.key in draft)) continue;
+    const parsed = parseConfigInput(field, draft[field.key]);
+    if ("error" in parsed) return parsed;
+    values[field.key] = parsed.value;
+  }
+  return { values };
+}
 
 /** 扩展市场的条目（与 `market::MarketEntry` 一致）。 */
 export type MarketEntry = {

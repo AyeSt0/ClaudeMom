@@ -79,6 +79,18 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../runtime/extensions.mjs"),
     ),
     (
+        "page-api.mjs",
+        include_bytes!("../runtime/page-api.mjs"),
+    ),
+    (
+        "ext-backend.mjs",
+        include_bytes!("../runtime/ext-backend.mjs"),
+    ),
+    (
+        "ext-backend-runner.mjs",
+        include_bytes!("../runtime/ext-backend-runner.mjs"),
+    ),
+    (
         "conversation-service.mjs",
         include_bytes!("../runtime/conversation-service.mjs"),
     ),
@@ -1958,6 +1970,8 @@ fn start_backend(
     if config.voice_input {
         host().prepare_dictation_service()?;
     }
+    // 注入计划在本地服务起来之前备好：页面一加载就要用。
+    crate::extensions::refresh_page_plan();
     let instance = uuid::Uuid::new_v4().to_string();
     let ready_file = root.join("ready.json");
     let log = private_file(&root.join("proxy.log"))?;
@@ -2014,6 +2028,8 @@ fn start_backend(
         .env("CLAUDE_LOCAL_BUILTIN_EXTENSIONS_DIR", root.join(crate::extensions::BUILTIN_DIR))
         .env("CLAUDE_LOCAL_EXTENSIONS_DIR", root.join("extensions"))
         .env("CLAUDE_LOCAL_EXTENSIONS_STATE", root.join("extensions.json"))
+        .env("CLAUDE_LOCAL_PAGE_PLAN", root.join(crate::extensions::plan::PLAN_FILE))
+        .env("CLAUDE_LOCAL_PAGE_STATUS", root.join(crate::extensions::STATUS_FILE))
         .env("CLAUDE_LOCAL_VOICE_INPUT", flag(config.voice_input))
         .env("CLAUDE_LOCAL_COMPUTER_USE", flag(config.computer_use))
         .env("CLAUDE_LOCAL_BACKGROUND_MODE", flag(config.background_mode))
@@ -2027,6 +2043,10 @@ fn start_backend(
         .env("CLAUDE_LOCAL_PLAN", config.normalized_plan());
     if let Some(dir) = recorded_data_dir() {
         command.env("CLAUDE_LOCAL_RECORDED_DIR", dir);
+    }
+    // 宿主自己托管拓展后台时，把它的凭据文件告诉本地服务：页面的后台调用转给宿主，同一个拓展只有一个后台实例。
+    if let Some(receipt) = host().extension_host_receipt() {
+        command.env("CLAUDE_LOCAL_EXT_HOST_RECEIPT", receipt);
     }
     command
         .stdin(Stdio::piped())

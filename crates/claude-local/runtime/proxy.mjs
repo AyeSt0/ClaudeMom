@@ -30,7 +30,9 @@ import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
 import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, isLocalNetworkHost, modelWindow, opencodeSessionHeaders, planProfile, requestSessionId, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
-import { EXTENSION_PREFIX, createExtensions } from "./extensions.mjs";
+import { EXTENSION_PREFIX, PAGE_PACKAGE_PREFIX, PAGE_RUNTIME_PATH, createExtensions, createPagePlan } from "./extensions.mjs";
+import { createBackendHost, defaultRunnerPath } from "./ext-backend.mjs";
+import { PAGE_API_PREFIX, createPageApi } from "./page-api.mjs";
 import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
 import { createBlobStore, createProjectApi, withProjectContext, withProjectMessages } from "./projects.mjs";
 
@@ -93,10 +95,36 @@ const extensions = runtime.managed && runtime.extensionDirs.length && runtime.ex
   ? createExtensions({ dirs: runtime.extensionDirs.map((dir) => path.resolve(dir)), stateFile: runtime.extensionsState })
   : null;
 
+// Codex++ 拓展包（codexpp.json）：页面运行时和每个包各是一个同源脚本，内容来自宿主程序写的注入计划（见 extensions.mjs）。
+// 页面经 /__codex_plus/api/v1/ 调后台（见 page-api.mjs）；令牌每次启动现生成，随运行时脚本下发。
+const pagePlan = runtime.managed && runtime.pagePlan
+  ? createPagePlan({ planFile: path.resolve(runtime.pagePlan), isPrivate: isPrivateFile })
+  : null;
+const PAGE_TOKEN = crypto.randomBytes(32).toString("hex");
+const backendHost = pagePlan
+  ? createBackendHost({ runner: defaultRunnerPath(path.dirname(fileURLToPath(import.meta.url))), log: (...a) => log(...a) })
+  : null;
+const pageApi = pagePlan
+  ? createPageApi({
+    plan: pagePlan,
+    backends: backendHost,
+    token: PAGE_TOKEN,
+    origins: new Set(["https://claude.ai", "https://claude.com"]),
+    statusFile: runtime.pageStatus ? path.resolve(runtime.pageStatus) : "",
+    hostReceipt: runtime.extHostReceipt ? path.resolve(runtime.extHostReceipt) : "",
+    isPrivate: isPrivateFile,
+    log: (...a) => log(...a),
+  })
+  : null;
+
 // 插在官方脚本之前（有本地化 shim 时在它之后），这样扩展能赶在页面脚本前做事（比如包一层 fetch）。
 // 页面脚本带 nonce 时抄给我们的标签：线上外壳的 CSP 按 nonce 放行脚本。
+// 拓展包的脚本带 defer：等页面解析完再按顺序执行（那时 <body> 已经在了），仍然早于官方的模块脚本。
 function addExtensions(body) {
-  const assets = extensions?.assets() ?? [];
+  const assets = [
+    ...(extensions?.assets() ?? []),
+    ...(pagePlan?.scripts() ?? []).map((href) => ({ type: "script", href, defer: true })),
+  ];
   if (!assets.length) return body;
   const html = Buffer.isBuffer(body) ? body.toString("utf8") : body;
   const head = /<head\b[^>]*>/i.exec(html);
@@ -104,9 +132,9 @@ function addExtensions(body) {
   if (!head || !headEnd || head.index >= headEnd.index) return body;
   const nonce = /<script\b[^>]*\bnonce=(["'])([\w+/=-]+)\1/i.exec(html)?.[2];
   const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
-  const tags = assets.map(({ type, href }) => type === "style"
+  const tags = assets.map(({ type, href, defer }) => type === "style"
     ? `<link rel="stylesheet" href="${href}"${nonceAttr}>`
-    : `<script src="${href}"${nonceAttr}></script>`).join("");
+    : `<script src="${href}"${nonceAttr}${defer ? " defer" : ""}></script>`).join("");
   const contentStart = head.index + head[0].length;
   const headContent = html.slice(contentStart, headEnd.index);
   const shimTag = `<script src="${LOCALIZATION_SHIM_PATH}"></script>`;
@@ -2631,6 +2659,22 @@ function handle(req, res, hostHeader) {
     return mockApi(req, res, url);
   }
   if (runtime.managed && isMainClaudeHost && url.pathname.startsWith("/__codex_plus/")) {
+    if (pageApi && url.pathname.startsWith(PAGE_API_PREFIX)) return pageApi.handle(req, res, url.pathname);
+    // 运行时脚本里带着调用令牌：只给页面自己的同源请求，别的站点用 <script> 引不走。
+    const planScript = pagePlan && ["GET", "HEAD"].includes(req.method) && req.headers["sec-fetch-site"] === "same-origin" &&
+      (url.pathname === PAGE_RUNTIME_PATH || url.pathname.startsWith(PAGE_PACKAGE_PREFIX))
+      ? pagePlan.script(url.pathname, PAGE_TOKEN)
+      : null;
+    if (planScript !== null) {
+      const body = Buffer.from(planScript);
+      res.writeHead(200, {
+        "content-type": "text/javascript; charset=utf-8",
+        "content-length": body.length,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      return res.end(req.method === "HEAD" ? undefined : body);
+    }
     const asset = extensions && ["GET", "HEAD"].includes(req.method) && url.pathname.startsWith(EXTENSION_PREFIX)
       ? extensions.read(url.pathname.slice(EXTENSION_PREFIX.length))
       : null;
@@ -3412,6 +3456,7 @@ function shutdown() {
   stopping = true;
   clearTimeout(readyWriteTimer);
   stateStore.flush();
+  backendHost?.stopAll();
   outer.close(() => process.exit(0));
   for (const socket of clientSockets) socket.destroy();
   setTimeout(() => process.exit(0), 1000).unref();

@@ -178,7 +178,7 @@ before(async () => {
     "audio/tone.mp3": Buffer.from([0x49, 0x44, 0x33]),
   });
   fs.mkdirSync(path.join(root, "runtime", "scripts"), { recursive: true });
-  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "extensions.mjs", "plugins.mjs", "connectors.mjs", "projects.mjs", "scripts/patch-dictation-start.mjs"]) {
+  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "extensions.mjs", "page-api.mjs", "ext-backend.mjs", "ext-backend-runner.mjs", "plugins.mjs", "connectors.mjs", "projects.mjs", "scripts/patch-dictation-start.mjs"]) {
     fs.copyFileSync(path.join(here, file), path.join(root, "runtime", file));
   }
   fs.copyFileSync(
@@ -1466,6 +1466,225 @@ test("enabled extension packages are injected into the page shell and served sam
     assert.doesNotMatch(await shellOf(instance), /__codex_plus\/ext\//);
   } finally {
     await stop(instance);
+  }
+});
+
+// 计划样本由 Rust 测试生成（src/extensions/plan.rs 的 the_plan_matches_the_fixture_the_node_tests_use），两边对同一份形状。
+function writePagePlan(planFile, packageRoot, { mode = 0o600, mutate = (plan) => plan } = {}) {
+  const text = fs.readFileSync(path.join(here, "fixtures", "page-plan.json"), "utf8")
+    .split("<ROOT>").join(JSON.stringify(packageRoot).slice(1, -1))
+    .split("<RUNTIME>").join("window.fixtureRuntime = true;");
+  fs.writeFileSync(planFile, JSON.stringify(mutate(JSON.parse(text))), { mode });
+  fs.chmodSync(planFile, mode);
+}
+
+test("codexpp packages get the page runtime, one script each, and a guarded way to call their backend", async () => {
+  const resources = path.join(root, "desktop-resources-codexpp");
+  writeAsar(resources, {
+    "index.html": '<!doctype html><html data-build-id="fixture-build"><head><meta charset="UTF-8"><script nonce="n1">window.fixtureAppStarted = true;</script></head><body></body></html>',
+  });
+  const home = path.join(root, "codexpp-home");
+  const dir = path.join(home, "extensions", "demo");
+  fs.mkdirSync(path.join(dir, "css"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "codexpp.json"), "{}");
+  // 文件夹里有 codexpp.json：即使同时放了 manifest.json 并启用，也不走旧格式那条注入。
+  fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ id: "demo", name: "Demo", version: "1.0.0", scripts: ["main.js"] }));
+  fs.writeFileSync(path.join(dir, "main.js"), "window.demoRan = 1;");
+  fs.writeFileSync(path.join(dir, "css", "a.css"), "body { color: red; }");
+  fs.writeFileSync(path.join(dir, "backend.mjs"), `
+    export default function create(ctx) {
+      let count = 0;
+      return {
+        status: (params) => ({ count: ++count, params, host: ctx.host, extension: ctx.extension, cwd: process.cwd(), leaked: Object.keys(process.env).filter((name) => /^(CLAUDE_LOCAL_|CODEX_PLUS_)/.test(name)) }),
+        config: () => ctx.config,
+        fail: () => { throw new Error("boom"); },
+        tick: () => { ctx.emit("tick", { n: 1 }); return true; },
+        hidden: () => "not declared",
+      };
+    }`);
+  const state = path.join(home, "extensions.json");
+  fs.writeFileSync(state, JSON.stringify({ enabled: ["demo"] }));
+  const planFile = path.join(home, "page-plan.json");
+  const statusFile = path.join(home, "page-status.json");
+  writePagePlan(planFile, home);
+
+  const instance = await start({
+    CLAUDE_LOCAL_DESKTOP_RESOURCES: resources,
+    CLAUDE_LOCAL_EXTENSIONS_DIR: path.join(home, "extensions"),
+    CLAUDE_LOCAL_EXTENSIONS_STATE: state,
+    CLAUDE_LOCAL_PAGE_PLAN: planFile,
+    CLAUDE_LOCAL_PAGE_STATUS: statusFile,
+  });
+  const sameOrigin = { "sec-fetch-site": "same-origin" };
+  const get = (pathname, extraHeaders = sameOrigin) => request(instance, pathname, { host: "claude.ai", extraHeaders });
+  const shellOf = async () => (await request(instance, "/new", { host: "claude.ai" })).bytes.toString("utf8");
+  try {
+    const html = await shellOf();
+    assert.ok(html.includes(
+      '<script src="/__codex_plus/rt/runtime.js" nonce="n1" defer></script><script src="/__codex_plus/pkg/l-demo.js" nonce="n1" defer></script><script nonce="n1">',
+    ), html);
+    assert.doesNotMatch(html, /__codex_plus\/ext\/demo\//);
+    assert.equal((await get("/__codex_plus/ext/demo/main.js")).status, 404);
+
+    // 运行时带着令牌：只给同源请求，占位符换成本次启动的令牌。
+    const runtimeScript = await get("/__codex_plus/rt/runtime.js");
+    assert.equal(runtimeScript.status, 200);
+    assert.equal(runtimeScript.headers["content-type"], "text/javascript; charset=utf-8");
+    assert.equal(runtimeScript.headers["cache-control"], "no-store");
+    const source = runtimeScript.bytes.toString("utf8");
+    assert.doesNotMatch(source, /__CODEXPP_PAGE_TOKEN__/);
+    assert.ok(source.endsWith("window.fixtureRuntime = true;"));
+    const boot = JSON.parse(/^window\.__codexPlusClaudeBoot = (.*);$/m.exec(source)[1]);
+    assert.match(boot.token, /^[0-9a-f]{64}$/);
+    assert.deepEqual(boot.packages, [{ key: "local:demo", name: "Demo", slug: "l-demo" }]);
+    for (const headers of [{}, { "sec-fetch-site": "cross-site" }, { "sec-fetch-site": "same-site" }]) {
+      assert.equal((await get("/__codex_plus/rt/runtime.js", headers)).status, 404);
+      assert.equal((await get("/__codex_plus/pkg/l-demo.js", headers)).status, 404);
+    }
+
+    // 包脚本：样式变成字符串字面量，脚本现读；密钥不在里面。
+    const packageScript = (await get("/__codex_plus/pkg/l-demo.js")).bytes.toString("utf8");
+    assert.ok(packageScript.includes('runtime.addStyle(meta.key, "css/a.css", "body { color: red; }");'), packageScript);
+    assert.ok(packageScript.includes("window.demoRan = 1;"));
+    assert.doesNotMatch(packageScript, /sk-fixture/);
+    assert.doesNotThrow(() => new Function(packageScript));
+    fs.writeFileSync(path.join(dir, "main.js"), "window.demoRan = 2;");
+    assert.ok((await get("/__codex_plus/pkg/l-demo.js")).bytes.toString("utf8").includes("window.demoRan = 2;"));
+    for (const pathname of ["/__codex_plus/pkg/l-other.js", "/__codex_plus/pkg/l-demo", "/__codex_plus/pkg/..%2fl-demo.js", "/__codex_plus/rt/other.js"]) {
+      assert.equal((await get(pathname)).status, 404, pathname);
+    }
+
+    // 页面接口第一层：同源、来源、令牌、JSON、POST，缺一个都不行。
+    const good = { ...sameOrigin, origin: "https://claude.ai", "x-codex-plus-ext": boot.token };
+    const api = (op, body, extraHeaders = good, options = {}) =>
+      request(instance, `/__codex_plus/api/v1/${op}`, { host: "claude.ai", body, extraHeaders, ...options });
+    const call = { key: "local:demo", method: "status", params: { a: 1 } };
+    for (const [label, headers, status] of [
+      ["没有令牌", { ...good, "x-codex-plus-ext": "" }, 403],
+      ["令牌不对", { ...good, "x-codex-plus-ext": "0".repeat(64) }, 403],
+      ["跨站", { ...good, "sec-fetch-site": "cross-site" }, 403],
+      ["别的来源", { ...good, origin: "https://evil.example" }, 403],
+      ["没有来源", { ...sameOrigin, "x-codex-plus-ext": boot.token }, 403],
+    ]) {
+      const refused = await api("call", call, headers);
+      assert.equal(refused.status, status, label);
+      assert.equal(refused.json.ok, false, label);
+    }
+    assert.equal((await api("call", call, good, { type: "text/plain" })).status, 415);
+    assert.equal((await api("call", undefined, good, { method: "GET" })).status, 405);
+    assert.equal((await api("nope", call)).status, 404);
+    assert.equal((await api("call", Buffer.from("{bad"))).status, 400);
+    assert.equal((await api("call", { ...call, params: "x".repeat(1024 * 1024) })).status, 413);
+    assert.equal(fs.existsSync(path.join(home, "extension-data")), false, "被拒的调用不该把后台拉起来");
+
+    // 第二层：只有启用中的包、声明过的方法和路由。
+    assert.equal((await api("call", { ...call, key: "local:other" })).json.code, "not_enabled");
+    for (const method of ["hidden", "__proto__", "constructor", ""]) {
+      const refused = await api("call", { ...call, method });
+      assert.deepEqual([refused.status, refused.json.code], [403, "unsupported"], method);
+    }
+    const first = await api("call", call);
+    assert.equal(first.status, 200, JSON.stringify(first.json));
+    assert.deepEqual(first.json.result.params, { a: 1 });
+    assert.deepEqual([first.json.result.count, first.json.result.host, first.json.result.extension], [1, "claudeDesktop", "demo"]);
+    assert.equal(fs.realpathSync(first.json.result.cwd), fs.realpathSync(path.join(home, "extension-data", "demo")));
+    assert.deepEqual(first.json.result.leaked, [], "后台进程拿不到本地服务的环境变量（里面有上游的 Key）");
+    assert.equal((await api("call", call)).json.result.count, 2, "后台常驻，两次调用是同一个实例");
+    assert.deepEqual((await api("call", { key: "local:demo", method: "config" })).json.result, { minutes: 5, token: "sk-fixture" });
+    const failed = await api("call", { key: "local:demo", method: "fail" });
+    assert.equal(failed.status, 502);
+    assert.match(failed.json.error, /boom/);
+
+    // 事件：从队尾开始订阅，之后长轮询取走新事件。
+    const latest = await api("events", { key: "local:demo", since: "latest" });
+    assert.deepEqual([latest.json.result.events.length, latest.json.result.running], [0, true]);
+    assert.equal((await api("call", { key: "local:demo", method: "tick" })).json.result, true);
+    const events = await api("events", { key: "local:demo", since: latest.json.result.next, waitMs: 2000 });
+    assert.deepEqual(events.json.result.events.map((item) => [item.event, item.payload]), [["tick", { n: 1 }]]);
+    assert.deepEqual((await api("stop", { key: "local:demo" })).json.result, { stopped: false });
+
+    // 路由：要既在 Claude 开放的路由里，又在清单 permissions.routes 里。
+    assert.equal((await api("route", { key: "local:demo", route: "/backend/status" })).json.result.host, "claudeDesktop");
+    assert.equal((await api("route", { key: "local:demo", route: "/usage/history" })).json.code, "unsupported");
+    assert.equal((await api("route", { key: "local:demo", route: "/diagnostics/log" })).json.code, "unsupported");
+    assert.equal((await api("config", { key: "local:demo", values: {} })).json.code, "unsupported");
+
+    // 页面回报的加载结果落盘，只留认识的字段。
+    const saved = await api("status", { scripts: { "local:demo": { status: "failed", error: "x".repeat(9000), unsupported: ["registerSlot:a", 3], extra: 1 } }, mounts: { rail: "ok", bad: {} } });
+    assert.equal(saved.status, 200);
+    const status = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    assert.deepEqual(Object.keys(status.scripts["local:demo"]).sort(), ["error", "loadedAt", "status", "unsupported"]);
+    assert.equal(status.scripts["local:demo"].error.length, 4000);
+    assert.deepEqual([status.scripts["local:demo"].unsupported, status.mounts], [["registerSlot:a"], { rail: "ok" }]);
+
+    // 计划变了不用重启：停用后页面上什么都不加，脚本和接口都关上，后台随下一次回报停掉。
+    writePagePlan(planFile, home, { mutate: (plan) => ({ ...plan, runtime: null, packages: [] }) });
+    assert.doesNotMatch(await shellOf(), /__codex_plus\/(rt|pkg)\//);
+    assert.equal((await get("/__codex_plus/rt/runtime.js")).status, 404);
+    assert.equal((await api("call", call)).json.code, "not_enabled");
+    await api("status", { scripts: {} });
+    writePagePlan(planFile, home);
+    assert.equal((await api("call", call)).json.result.count, 1, "停用再启用后是新的后台实例");
+
+    // 别人也能读的计划文件不认（里面有给后台的配置）。
+    if (process.platform !== "win32") {
+      writePagePlan(planFile, home, { mode: 0o644 });
+      assert.doesNotMatch(await shellOf(), /__codex_plus\/(rt|pkg)\//);
+    }
+  } finally {
+    await stop(instance);
+  }
+});
+
+test("with an external host the backend calls are forwarded instead of spawning a backend here", async () => {
+  const home = path.join(root, "codexpp-forward");
+  fs.mkdirSync(path.join(home, "extensions", "demo"), { recursive: true });
+  const planFile = path.join(home, "page-plan.json");
+  writePagePlan(planFile, home);
+  const seen = [];
+  const hostToken = crypto.randomUUID();
+  const externalHost = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      seen.push({ url: req.url, token: req.headers["x-codex-plus-claude-ext"], body });
+      const reply = body.method === "fail" ? { ok: false, error: "host says no", code: "unsupported" } : { ok: true, result: { from: "host", op: req.url } };
+      res.writeHead(reply.ok ? 200 : 403, { "content-type": "application/json" });
+      res.end(JSON.stringify(reply));
+    });
+  });
+  externalHost.listen(0, "127.0.0.1");
+  await once(externalHost, "listening");
+  const receipt = path.join(home, "claude-ext-host.json");
+  fs.writeFileSync(receipt, JSON.stringify({ port: externalHost.address().port, token: hostToken }), { mode: 0o600 });
+  const instance = await start({ CLAUDE_LOCAL_PAGE_PLAN: planFile, CLAUDE_LOCAL_EXT_HOST_RECEIPT: receipt });
+  try {
+    const source = (await request(instance, "/__codex_plus/rt/runtime.js", { host: "claude.ai", extraHeaders: { "sec-fetch-site": "same-origin" } })).bytes.toString("utf8");
+    const token = JSON.parse(/^window\.__codexPlusClaudeBoot = (.*);$/m.exec(source)[1]).token;
+    const api = (op, body) => request(instance, `/__codex_plus/api/v1/${op}`, {
+      host: "claude.ai", body, extraHeaders: { "sec-fetch-site": "same-origin", origin: "https://claude.ai", "x-codex-plus-ext": token },
+    });
+    const called = await api("call", { key: "local:demo", method: "status", params: { a: 1 }, instance: "page-1" });
+    assert.deepEqual(called.json, { ok: true, result: { from: "host", op: "/claude-ext/v1/call" } });
+    assert.deepEqual(seen[0], { url: "/claude-ext/v1/call", token: hostToken, body: { key: "local:demo", method: "status", params: { a: 1 }, instance: "page-1" } });
+    assert.equal(fs.existsSync(path.join(home, "extension-data")), false);
+    assert.equal((await api("events", { key: "local:demo", since: 3, waitMs: 0 })).json.result.op, "/claude-ext/v1/events");
+    assert.equal((await api("config", { key: "local:demo", values: { minutes: 1 } })).json.result.op, "/claude-ext/v1/config");
+    const refused = await api("call", { key: "local:demo", method: "fail" });
+    assert.deepEqual([refused.status, refused.json.error, refused.json.code], [403, "host says no", "unsupported"]);
+    // 声明约束仍在本地先查一遍：没声明的方法到不了托管方。
+    const before = seen.length;
+    assert.equal((await api("call", { key: "local:demo", method: "hidden" })).status, 403);
+    assert.equal(seen.length, before);
+    // 托管方不在线：给出明确的原因，不会卡住。
+    fs.rmSync(receipt);
+    const offline = await api("call", { key: "local:demo", method: "status" });
+    assert.deepEqual([offline.status, offline.json.code], [503, "host_offline"]);
+    assert.match(offline.json.error, /Codex\+\+/);
+  } finally {
+    await stop(instance);
+    externalHost.close();
   }
 });
 

@@ -318,3 +318,14 @@ button.cm-update-chip:hover { background: var(--cm-accent); color: #fff; }
 .cm-search:focus { outline: none; border-color: var(--cm-accent); box-shadow: 0 0 0 3px var(--cm-accent-soft); }
 .cm-star { width: 11px; height: 11px; margin-right: 2px; vertical-align: -1px; }
 .cm-market-loading { height: 120px; }
+.cm-ext-note { margin-top: 3px; font-size: 11.5px; line-height: 1.5; color: var(--cm-muted); overflow-wrap: anywhere; }
+.cm-ext-note[data-tone="ok"] { color: var(--cm-ok); }
+.cm-ext-note[data-tone="error"] { color: var(--cm-danger); }
+.cm-ext-config { padding-top: 10px; border-top: 1px solid var(--cm-line); }
+.cm-ext-config .cm-field { align-items: start; }
+.cm-ext-config .cm-field-label { padding-top: 5px; }
+.cm-field textarea {
+  flex: 1; min-width: 0; padding: 6px 8px; resize: vertical; font-family: var(--cm-mono); font-size: 12px; line-height: 1.5;
+  border: 1px solid var(--cm-line-strong); border-radius: var(--cm-radius); background: var(--cm-panel); color: inherit;
+}
+.cm-field textarea:focus { outline: none; border-color: var(--cm-accent); box-shadow: 0 0 0 3px var(--cm-accent-soft); }

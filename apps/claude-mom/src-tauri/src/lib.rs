@@ -67,6 +67,7 @@ pub fn run() {
             commands::claude_local_extension_enable,
             commands::claude_local_extension_import,
             commands::claude_local_extension_remove,
+            commands::claude_local_extension_config,
             commands::claude_local_extension_open_folder,
             commands::claude_local_extension_market,
             commands::claude_local_extension_install,

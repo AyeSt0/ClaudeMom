@@ -285,6 +285,18 @@ pub fn claude_local_extension_remove(id: String) -> CommandResult<ExtensionsPayl
     }
 }
 
+/// 保存一个拓展包的配置：只收清单里声明过的项。
+#[tauri::command]
+pub fn claude_local_extension_config(id: String, values: serde_json::Map<String, Value>) -> CommandResult<ExtensionsPayload> {
+    match claude_local::extensions::set_config(&id, &values) {
+        Ok(extensions) => {
+            let name = extensions.iter().find(|item| item.id == id).map_or(id.as_str(), |item| item.name.as_str());
+            ok(&format!("已保存「{name}」的设置，{REFRESH_HINT}"), ExtensionsPayload { extensions })
+        }
+        Err(error) => failed(&format!("{error:#}"), extensions_payload()),
+    }
+}
+
 #[tauri::command]
 pub fn claude_local_extension_open_folder() -> CommandResult<ExtensionsPayload> {
     match claude_local::extensions::open_folder() {

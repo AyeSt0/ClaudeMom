@@ -25,6 +25,8 @@ Claude 安装包。代理、证书、缓存和会话数据由 Codex++ 放在独�
 | `CLAUDE_LOCAL_READY_FILE` / `_INSTANCE_ID` | 本次启动的就绪回执和实例标识 |
 | `CLAUDE_LOCAL_LOCALIZATION` / `_VOICE_INPUT` / `_COMPUTER_USE` / `_BACKGROUND_MODE` / `_FORCE_BACKGROUND_MODE` | 各能力的独立开关，`0` 关闭、`1` 开启；最后一个无视后台模式的 macOS 版本上限 |
 | `CLAUDE_LOCAL_BUILTIN_EXTENSIONS_DIR` / `_EXTENSIONS_DIR` / `_EXTENSIONS_STATE` | 页面扩展：内置与用户的扩展目录（`<id>/manifest.json`），和记录启用了哪些的状态文件（`{"enabled":[...]}`）。启用中的扩展按清单以 `/__codex_plus/ext/<id>/<文件>` 插进页面外壳、官方脚本之前，每次请求现读 |
+| `CLAUDE_LOCAL_PAGE_PLAN` / `_PAGE_STATUS` | Codex++ 拓展包（`<id>/codexpp.json`）：宿主程序写的注入计划（`page-plan.json`，只认只有本人可读的文件），和页面回报各拓展加载结果的文件。见下文「拓展包与页面接口」 |
+| `CLAUDE_LOCAL_EXT_HOST_RECEIPT` | 外部托管方的凭据文件（`{"port", "token"}`）。给了就不在本地起拓展后台，页面的后台调用转给它；Codex++ 用它让页面和 Code 会话共用同一个后台实例 |
 | `CLAUDE_LOCAL_COWORK` | Cowork 总开关（GrowthBook `yukon_silver`），默认开，`0` 时按录制模板里 Claude 自己的值 |
 | `CLAUDE_LOCAL_COWORK_PROMPT_FILE` | 覆盖 Cowork 系统提示词的文件；不设时从本机 `app.asar` 读，读不到用内置兜底文案 |
 | `CLAUDE_LOCAL_TEMPLATE` | 录制版用哪个录制版本（`mock/<build>/` 的目录名，即前端 build id）；不设或已下架时用最新的（按页面外壳的 `data-build-timestamp`） |
@@ -465,3 +467,46 @@ MFA 仅提供本地模拟账号的 GET 状态，不修改真实账号的双重�
    账号 uuid、组织名），实测后提交。录制目录和临时 Chrome profile 用完删掉。
 
 旧版本保留，太旧或用不了的直接删目录。
+
+## 拓展包与页面接口
+
+`extensions/` 里除了页面扩展（`manifest.json`），还能放 Codex++ 的拓展包（`codexpp.json`）。文件夹里有 `codexpp.json` 就按拓展包处理，旧格式那条注入会跳过它。拓展包在 Claude 页面里的部分写在清单的 `claudeDesktop` 块里：
+
+| 字段 | 含义 |
+| --- | --- |
+| `claudeDesktop.renderer` | 注入页面的脚本（`.js`，字符串或数组），按顺序拼在同一个作用域里执行 |
+| `claudeDesktop.styles` | 样式（`.css` 数组） |
+| `claudeDesktop.methods` | 页面可以调用的后台方法；后台是清单的 `backend.script` |
+
+清单规则只在 Rust 里（`src/extensions/codexpp.rs`），本地服务不解析清单：宿主程序把启用中的包渲染成一份注入计划（`src/extensions/plan.rs`），本地服务只做读文件、拼接。
+
+### 页面上多了什么
+
+- `/__codex_plus/rt/runtime.js`：页面运行时（`page-runtime.js`），提供 `window.codexPlus`，成员名与 Codex++ 的接口一致（契约清单 `page-api.json`）。`codexPlus.host` 是 `"claudeDesktop"`，`codexPlus.supports(名字)` 回答某个挂载点在这里可不可用。
+- `/__codex_plus/pkg/<slug>.js`：每个拓展包一个脚本，由 `page-wrap.js` 包装。一个包语法错误或抛错只影响它自己。
+- 两者都带 `defer` 插在官方脚本之前，只回应同源请求（`Sec-Fetch-Site: same-origin`）。
+
+### 页面调后台
+
+`POST /__codex_plus/api/v1/<op>`，请求体和回应都是 JSON，回应是 `{ "ok": true, "result": … }` 或 `{ "ok": false, "error": "…", "code": "…" }`。
+
+| op | 请求体 | 作用 |
+| --- | --- | --- |
+| `call` | `{ key, method, params, timeoutMs?, instance? }` | 调后台方法；首次调用时启动后台进程 |
+| `events` | `{ key, since, waitMs }` | 长轮询后台 `emit` 的事件；`since: "latest"` 取当前队尾 |
+| `stop` | `{ key, instance? }` | 页面实例卸载时发；Claude 下不停后台 |
+| `route` | `{ key, route, payload }` | 调开放的路由：`/diagnostics/log`、`/backend/status` |
+| `status` | `{ scripts, mounts }` | 页面回报各拓展的加载结果，写进 `CLAUDE_LOCAL_PAGE_STATUS` |
+| `config` | `{ key, values }` | 在页面里改配置；只有外部托管方支持 |
+
+请求要同时满足：Claude 主域、`POST`、`Content-Type: application/json`、`Sec-Fetch-Site: same-origin`、`Origin` 是 Claude 主域、请求头 `x-codex-plus-ext` 等于本次启动的随机令牌（随运行时脚本下发）。之后再按注入计划校验：包要启用，方法要在 `claudeDesktop.methods` 里，路由要在清单 `permissions.routes` 里。请求体上限 1 MiB，回应上限 4 MiB，每个拓展同时最多 16 个调用。
+
+这层校验把页面能做的事限制到拓展声明过的范围，但它不是拓展之间的隔离：页面里的官方脚本和拓展脚本同权，令牌对它们藏不住。所以配置里的密钥项（`secret`）不下发页面，只交给后台。
+
+### 后台
+
+后台由 `ext-backend.mjs` 托管，运行器是 `ext-backend-runner.mjs`：一个拓展包一个 Node 进程，工作目录是它的数据目录（`extension-data/<id>`），环境变量里去掉了本地服务自己的 `CLAUDE_LOCAL_*`、`CODEX_PLUS_*`、`ANTHROPIC_*`。脚本或配置变了下次调用时重启，空闲 30 分钟、拓展被停用、本地服务退出时停掉。后台脚本的形式是 `export default function create(ctx)`，返回方法表；`ctx` 有 `extension`、`host`（`"claudeDesktop"`）、`config`、`dataDir`、`emit`、`provide`、`service`、`log`，以及在 Claude 下一律报错的 `sessionQuery`、`sessions`、`llm`、`ui`。
+
+### 外部托管方
+
+设了 `CLAUDE_LOCAL_EXT_HOST_RECEIPT` 时，`call`、`events`、`config` 在本地校验后转给 `http://127.0.0.1:<port>/claude-ext/v1/<op>`：请求体与上表相同，请求头 `x-codex-plus-claude-ext` 带凭据里的令牌，回应形状与页面接口相同。凭据文件读不到时回 `503`、`code: "host_offline"`。

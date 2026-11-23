@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import { Check, ChevronDown, Download, Eye, EyeOff, FolderOpen, Loader2, PackagePlus, Play, Plus, Puzzle, RefreshCw, Server, ShieldCheck, SlidersHorizontal, Square, Star, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { IMPORT_SOURCES, SOURCE_LABELS, WINDOW_PRESETS, claudeState, compareVersions, emptyProfile, formatWindow, hostOf, isOk, modelLabel, normalizeModels, profileProblem, setupSteps, type ClaudeConfig, type ClaudeStatus, type CommandResult, type ExtensionInfo, type MarketEntry, type UpstreamBook, type UpstreamModel, type UpstreamProfile, templateLabel } from "./model";
+import { IMPORT_SOURCES, SOURCE_LABELS, WINDOW_PRESETS, claudeState, compareVersions, configInputText, configValues, emptyProfile, extensionRuntimeNote, formatWindow, hostOf, isOk, localizedText, modelLabel, normalizeModels, profileProblem, setupSteps, type ClaudeConfig, type ClaudeStatus, type CommandResult, type ExtensionConfigField, type ExtensionInfo, type MarketEntry, type UpstreamBook, type UpstreamModel, type UpstreamProfile, templateLabel } from "./model";
 import { checkForUpdate, currentVersion, installUpdate, type UpdateState } from "./updates";
 
 type Tab = "upstream" | "claude" | "extensions";
@@ -585,7 +585,67 @@ type ExtensionsResult = CommandResult<{ extensions: ExtensionInfo[] }>;
 type MarketResult = CommandResult<{ entries: MarketEntry[] }>;
 const MARKET_REPO_URL = "https://github.com/BigPizzaV3/claude-mom-extensions";
 
-/** 页面扩展：注入 Claude 页面的 js / css 包，本地导入或从市场装。开关、安装、删除都是刷新 Claude 页面就生效。 */
+/** 一个拓展包的配置表单：清单里声明了哪些项就画哪些。密钥项读回来是打码的，不动它就保留原值。 */
+function ExtensionConfig({ item, busy, onSave, onNotice }: {
+  item: ExtensionInfo;
+  busy: boolean;
+  onSave: (values: Record<string, unknown>) => void;
+  onNotice: (text: string, tone?: "ok" | "error") => void;
+}) {
+  const saved = JSON.stringify(item.config ?? {});
+  const fromSaved = () => Object.fromEntries(item.configSchema.map((field) => [field.key, configInputText(field, item.config?.[field.key])]));
+  const [draft, setDraft] = useState<Record<string, string>>(fromSaved);
+  // 保存后列表带回新的生效值：表单跟上。别的操作刷新列表时值没变，不动正在填的内容。
+  useEffect(() => setDraft(fromSaved()), [saved]);
+  const set = (key: string, text: string) => setDraft((current) => ({ ...current, [key]: text }));
+  const save = () => {
+    const result = configValues(item.configSchema, draft);
+    if ("error" in result) onNotice(result.error, "error");
+    else onSave(result.values);
+  };
+  const control = (field: ExtensionConfigField) => {
+    const value = draft[field.key] ?? "";
+    const label = localizedText(field.title) || field.key;
+    switch (field.type) {
+      case "boolean":
+        return <input aria-label={label} checked={value === "true"} onChange={(event) => set(field.key, String(event.currentTarget.checked))} type="checkbox" />;
+      case "select":
+        return (
+          <select aria-label={label} onChange={(event) => set(field.key, event.currentTarget.value)} value={value}>
+            {field.options.map((option) => <option key={String(option.value)} value={String(option.value)}>{option.label}</option>)}
+          </select>
+        );
+      case "text":
+      case "array":
+      case "object":
+        return <textarea aria-label={label} onChange={(event) => set(field.key, event.currentTarget.value)} rows={field.type === "text" ? 3 : 4} spellCheck={false} value={value} />;
+      case "number":
+        return <input aria-label={label} inputMode="decimal" onChange={(event) => set(field.key, event.currentTarget.value)} spellCheck={false} value={value} />;
+      default:
+        return <input aria-label={label} onChange={(event) => set(field.key, event.currentTarget.value)} spellCheck={false} type={field.secret ? "password" : "text"} value={value} />;
+    }
+  };
+  return (
+    <div className="cm-form cm-ext-config">
+      {item.configSchema.map((field) => {
+        const hint = [
+          localizedText(field.description),
+          field.secret ? "只交给这个拓展的后台，不会出现在 Claude 页面里。" : "",
+          field.type === "array" ? "按 JSON 数组填写。" : field.type === "object" ? "按 JSON 对象填写。" : "",
+        ].filter(Boolean).join(" ");
+        return <Field hint={hint || undefined} key={field.key} label={localizedText(field.title) || field.key}>{control(field)}</Field>;
+      })}
+      <div className="cm-row-actions">
+        <button className="cm-btn cm-btn-small cm-btn-primary" disabled={busy} onClick={save} type="button">保存设置</button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 扩展：注入 Claude 页面的包，本地导入或从市场装。两种格式在同一个列表里：页面扩展（manifest.json，js / css），
+ * 和 Codex++ 拓展包（codexpp.json，带页面接口、配置和后台）。开关、安装、删除、改设置都是刷新 Claude 页面就生效。
+ */
 function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (text: string, tone?: "ok" | "error") => void }) {
   const [items, setItems] = useState<ExtensionInfo[] | null>(null);
   const [market, setMarket] = useState<MarketEntry[] | null>(null);
@@ -593,6 +653,7 @@ function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (
   const [view, setView] = useState<"installed" | "market">("installed");
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  const [configOpen, setConfigOpen] = useState<string | null>(null);
 
   const call = async (label: string, command: string, args: Record<string, unknown> = {}) => {
     setBusy(label);
@@ -631,10 +692,22 @@ function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (
     const path = await open({
       directory: false,
       multiple: false,
-      title: "选择扩展包的 .zip，或扩展文件夹里的 manifest.json",
+      title: "选择扩展包的 .zip，或扩展文件夹里的 manifest.json / codexpp.json",
       filters: [{ name: "扩展包", extensions: ["zip", "json"] }],
     });
     if (typeof path === "string") await call("import", "claude_local_extension_import", { path });
+  };
+
+  const toggle = async (item: ExtensionInfo, enabled: boolean) => {
+    // 带后台的拓展包：启用前说清楚它会在本机运行什么。
+    if (enabled && item.capabilities.includes("backend")) {
+      const yes = await ask(
+        `「${item.name}」带后台进程：启用后，Claude 页面用到它时会以你的身份在本机运行包里的 Node 脚本，它能读写文件、联网。\n\n只启用自己写的或信得过的拓展。确定启用？`,
+        { title: "启用带后台的拓展", kind: "warning", okLabel: "启用", cancelLabel: "取消" },
+      );
+      if (!yes) return;
+    }
+    await call(`enable:${item.id}`, "claude_local_extension_enable", { id: item.id, enabled });
   };
 
   const remove = async (item: ExtensionInfo) => {
@@ -663,7 +736,8 @@ function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (
   const updates = new Map((market ?? [])
     .filter((entry) => {
       const local = installed.get(entry.id);
-      return local && !local.builtin && compareVersions(entry.version, local.version) > 0;
+      // 市场里收的是页面扩展；手动导入的同名拓展包不拿市场的版本来比。
+      return local && !local.builtin && local.format === "manifest" && compareVersions(entry.version, local.version) > 0;
     })
     .map((entry) => [entry.id, entry]));
   const needle = query.trim().toLowerCase();
@@ -671,7 +745,7 @@ function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (
 
   return (
     <div className="cm-settings">
-      <PageHead hint="注入 Claude 页面的脚本和样式。开关、安装、删除后刷新 Claude 页面（Cmd/Ctrl+R）生效。" title="扩展">
+      <PageHead hint="注入 Claude 页面的脚本、样式和 Codex++ 拓展包。开关、安装、删除、改设置后刷新 Claude 页面（Cmd/Ctrl+R）生效。" title="扩展">
         <button className="cm-btn" disabled={busy !== null} onClick={() => void call("open", "claude_local_extension_open_folder")} type="button"><FolderOpen />打开文件夹</button>
         <button className="cm-btn" disabled={busy !== null} onClick={() => void importPackage()} type="button">
           {busy === "import" ? <Loader2 className="cm-spin" /> : <PackagePlus />}导入扩展包
@@ -703,6 +777,7 @@ function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (
           <p className="cm-field-hint">扩展在官方脚本之前运行，能读到页面里的一切（包括对话内容）。只装自己写的或信得过的。</p>
           {items.map((item) => {
             const update = updates.get(item.id);
+            const running = extensionRuntimeNote(item);
             return (
               <section className="cm-card" key={item.id}>
                 <label className="cm-toggle-row">
@@ -711,15 +786,19 @@ function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (
                       <strong className="cm-ext-name">{item.name}</strong>
                       {item.version ? <span className="cm-tag cm-mono">v{item.version}</span> : null}
                       {item.builtin ? <span className="cm-tag">内置</span> : null}
+                      {item.format === "codexpp" ? <span className="cm-tag">拓展包</span> : null}
+                      {item.capabilities.includes("backend") ? <span className="cm-tag">带后台</span> : null}
                     </span>
                     {item.error
                       ? <span className="cm-warn-text cm-ext-desc">清单有问题：{item.error}</span>
                       : <span className="cm-field-hint cm-ext-desc">{item.description || "没有说明"}</span>}
+                    {running ? <span className="cm-ext-note" data-tone={running.tone}>{running.text}</span> : null}
+                    {item.notes.map((note) => <span className="cm-ext-note" data-tone="muted" key={note}>{note}</span>)}
                   </span>
                   <input
                     checked={item.enabled}
                     disabled={busy !== null || (Boolean(item.error) && !item.enabled)}
-                    onChange={(event) => void call(`enable:${item.id}`, "claude_local_extension_enable", { id: item.id, enabled: event.currentTarget.checked })}
+                    onChange={(event) => void toggle(item, event.currentTarget.checked)}
                     type="checkbox"
                   />
                   <span aria-hidden="true" className="cm-switch" />
@@ -728,6 +807,14 @@ function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (
                   <span className="cm-mono">{item.id}</span>
                   {item.author ? <span>· {item.author}</span> : null}
                   <span className="cm-spacer" />
+                  {item.configSchema.length ? (
+                    <button
+                      aria-expanded={configOpen === item.id}
+                      className="cm-btn cm-btn-small"
+                      onClick={() => setConfigOpen(configOpen === item.id ? null : item.id)}
+                      type="button"
+                    ><SlidersHorizontal />设置</button>
+                  ) : null}
                   {update ? (
                     <button className="cm-btn cm-btn-small cm-btn-primary" disabled={busy !== null} onClick={() => void install(update, true)} type="button">
                       {busy === `install:${item.id}` ? <Loader2 className="cm-spin" /> : <Download />}更新到 {update.version}
@@ -737,11 +824,22 @@ function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (
                     <button className="cm-btn cm-btn-small cm-btn-danger" disabled={busy !== null} onClick={() => void remove(item)} type="button"><Trash2 />删除</button>
                   )}
                 </div>
+                {configOpen === item.id && item.configSchema.length ? (
+                  <ExtensionConfig
+                    busy={busy !== null}
+                    item={item}
+                    onNotice={onNotice}
+                    onSave={(values) => void call(`config:${item.id}`, "claude_local_extension_config", { id: item.id, values })}
+                  />
+                ) : null}
               </section>
             );
           })}
           <p className="cm-field-hint">
             扩展包是一个文件夹：manifest.json 写 id、name、version、author、description，以及要注入的 scripts（.js）和 styles（.css）。可以直接导入文件夹里的 manifest.json，或把文件夹打成 .zip 导入。
+          </p>
+          <p className="cm-field-hint">
+            也可以导入 Codex++ 的拓展包（文件夹里是 codexpp.json）：页面部分写在 claudeDesktop 的 renderer、styles、methods 里，脚本里能用 codexPlus 接口、读配置、调自己的后台。包里只对 Codex 生效的部分在这里不运行。
           </p>
         </>
       ) : (
