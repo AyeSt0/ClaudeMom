@@ -322,7 +322,8 @@ export function claudeState(status: ClaudeStatus | null, busy: string | null): {
 
 /** 启动前还差什么：按顺序列出，界面逐条给按钮。 */
 export function setupSteps(status: ClaudeStatus | null, active: UpstreamProfile | null): Array<{ id: "upstream" | "node" | "trust"; text: string }> {
-  if (!status || !status.supported) return [];
+  // 没认出 Claude 时其它缺项照样列出：顶栏只说「需要先安装」，Node 这类缺项不能被它盖住（#46）。
+  if (!status) return [];
   const steps: Array<{ id: "upstream" | "node" | "trust"; text: string }> = [];
   if (!active || profileProblem(active)) steps.push({ id: "upstream", text: "先添加一组上游并选好默认模型" });
   if (!status.nodeAvailable) steps.push({ id: "node", text: "需要 Node.js（支持 fetch 与 WebSocket 的版本）" });

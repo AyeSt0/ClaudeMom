@@ -38,6 +38,8 @@ test("启动前清单按顺序列出缺的步骤", () => {
   const ready = { ...emptyProfile(), baseUrl: "https://a.example", model: "m" };
   assert.deepEqual(setupSteps(status(), ready), []);
   assert.deepEqual(setupSteps(status({ caTrusted: false, nodeAvailable: false }), null).map((step) => step.id), ["upstream", "node", "trust"]);
+  // 没认出 Claude 时缺 Node 的提示也要在（#46）。
+  assert.deepEqual(setupSteps(status({ supported: false, nodeAvailable: false }), ready).map((step) => step.id), ["node"]);
   // 第三方模式不经代理：不要求信任证书。
   assert.deepEqual(setupSteps(status({ caTrusted: false, config: { ...status().config, threePMode: true } }), null).map((step) => step.id), ["upstream"]);
 });
