@@ -151,6 +151,33 @@ codexPlus.extension((ctx) => {
     return "other";
   }
 
+  /** 锚点测试用的样本（与 dev/export-dom.js 同一格式）：只有标签、类名前 6 个、data-testid 等，不带文字。 */
+  function fixture() {
+    const turns = new Map();
+    const node = (el) => {
+      const attrs = {};
+      const cls = (typeof el.className === "string" ? el.className : "").trim().split(/\s+/).filter(Boolean).slice(0, 6).join(" ");
+      if (cls) attrs.class = cls;
+      for (const name of ["data-testid", "role", "type", "contenteditable"]) {
+        const value = el.getAttribute(name);
+        if (value !== null) attrs[name] = value;
+      }
+      if (el.hasAttribute("href")) attrs.href = el.getAttribute("href").replace(UUID, "00000000-0000-4000-8000-000000000001");
+      if (el.hasAttribute("data-turn-key")) {
+        const key = el.getAttribute("data-turn-key");
+        if (!turns.has(key)) turns.set(key, `turn-${turns.size + 1}`);
+        attrs["data-turn-key"] = turns.get(key);
+      }
+      const tag = el.tagName.toLowerCase();
+      const skipInside = tag === "svg" || /standard-markdown/.test(cls);
+      const children = skipInside ? [] : [...el.children]
+        .filter((child) => !child.matches("[data-codex-plus-claude], [data-codex-plus-ext], script, style, link, [aria-hidden=true][data-cds=Icon]"))
+        .map(node);
+      return [tag, attrs, children];
+    };
+    return { origin: location.origin, pathname: location.pathname.replace(UUID, ":uuid"), build: document.documentElement.getAttribute("data-build-id"), body: node(document.body) };
+  }
+
   function collect() {
     const root = getComputedStyle(document.documentElement);
     const testids = {};
@@ -177,6 +204,7 @@ codexPlus.extension((ctx) => {
       settings: settings(),
       menus: menus(),
       skeleton: tree(document.body, 9, { left: 900 }),
+      fixture: fixture(),
     };
   }
 
@@ -197,6 +225,47 @@ codexPlus.extension((ctx) => {
     }
   }
 
+  // 自动巡览：依次打开各页签，每页加载好后存一份。换页用整页跳转，进度记在 sessionStorage 里，
+  // 下一页加载时由新的探针实例接着走。「第一个会话」一步在当前页面找不到对应链接时跳过。
+  const TOUR_KEY = "codexpp-dom-probe-tour";
+  const TOUR = [
+    { label: "chat-new", go: "/new" },
+    { label: "chat-conversation", link: /^\/chat\/[0-9a-f-]{36}/ },
+    { label: "cowork-new", go: "/cowork" },
+    { label: "cowork-session", link: /^\/(task|local_sessions|cowork)\/[^/]+/ },
+    { label: "code-new", go: "/epitaxy" },
+    { label: "code-session", link: /^\/(epitaxy|claude-code-desktop|code)\/[^/]+/ },
+    { label: "settings", go: "/settings" },
+  ];
+  const tourState = () => {
+    try { return JSON.parse(sessionStorage.getItem(TOUR_KEY) || "null"); } catch { return null; }
+  };
+  const findLink = (pattern) => all("a[href]").find((el) => {
+    try { return pattern.test(new URL(el.getAttribute("href"), location.href).pathname); } catch { return false; }
+  });
+  /** 从第 index 步起找第一个走得通的，跳过去；走完了收尾。 */
+  function tourGo(index) {
+    for (let step = index; step < TOUR.length; step += 1) {
+      const target = TOUR[step].go || findLink(TOUR[step].link)?.getAttribute("href");
+      if (!target) continue;
+      sessionStorage.setItem(TOUR_KEY, JSON.stringify({ index: step, done: false }));
+      location.assign(new URL(target, location.href).href);
+      return;
+    }
+    sessionStorage.setItem(TOUR_KEY, JSON.stringify({ index: TOUR.length, done: true }));
+    ctx.toast("DOM 探针：巡览完成", { type: "success" });
+  }
+  function tourResume() {
+    const state = tourState();
+    if (!state || state.done) return false;
+    ctx.setTimeout(async () => {
+      await save(`tour-${TOUR[state.index]?.label || "step"}`);
+      tourGo(state.index + 1);
+    }, 9000);
+    return true;
+  }
+  const startTour = () => tourGo(0);
+
   ctx.registerShortcut({ key: "Mod+Alt+Shift+D", description: "保存当前页面结构", run: () => save("shortcut") });
   ctx.registerFloatingTab({
     title: "DOM 探针",
@@ -214,10 +283,17 @@ codexPlus.extension((ctx) => {
       list.style.cssText = "margin:10px 0 0;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere";
       const refresh = () => ctx.backend.call("list").then((files) => { list.textContent = files.length ? files.join("\n") : "还没有保存过"; }, () => {});
       button.addEventListener("click", () => save("button").then(refresh));
-      container.append(note, button, list);
+      const tour = button.cloneNode(true);
+      tour.textContent = "自动巡览（Chat → Cowork → Code → 设置）";
+      tour.style.marginLeft = "8px";
+      tour.addEventListener("click", startTour);
+      container.append(note, button, tour, list);
       refresh();
     },
   });
-  // 页面加载好之后自动存一份，省得忘。
-  ctx.setTimeout(() => save("auto"), 6000);
+  // 巡览中就接着走；否则页面加载好之后自动存一份，省得忘。配置里开了「启动后自动巡览」时，每个窗口第一次加载时开始巡览。
+  if (!tourResume()) {
+    if (ctx.config?.autoTour && !tourState()) ctx.setTimeout(startTour, 9000);
+    else ctx.setTimeout(() => save("auto"), 6000);
+  }
 });
