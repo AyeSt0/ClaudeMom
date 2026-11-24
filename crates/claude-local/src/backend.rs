@@ -3954,9 +3954,9 @@ RGvMS5OzZFvnFlekIHE6c+6QK9QtWD7P+PkIpRa1D01cb9SwsRHqGfs7o2UbaZxs\n\
         let old: ClaudeLocalSettings = serde_json::from_value(json!({ "enabled": true, "localShell": true })).unwrap();
         assert!(!old.three_p_mode);
         assert!(value.get("localShell").is_none());
-        // 合并式主页默认关（经典主页有「对话 | Cowork」切换）。
-        assert!(!legacy.hub_home);
-        assert_eq!(value["hubHome"], false);
+        // 合并式主页默认开（录制模板的账号在这个实验组里）；旧版设置文件没有这一项也按开。
+        assert!(legacy.hub_home);
+        assert_eq!(value["hubHome"], true);
         // 第三方模式默认关。
         assert!(!legacy.three_p_mode);
         assert_eq!(value["threePMode"], false);

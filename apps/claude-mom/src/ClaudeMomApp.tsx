@@ -995,7 +995,7 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice }: {
           </Field>
         ) : null}
         {config.threePMode ? null : (
-          <Toggle checked={config.hubHome ?? false} detail="Claude 正在小范围试验的主页布局：对话和 Cowork 合在一个输入框里，没有「对话 | Cowork」切换。关着时用有切换的经典主页" disabled={disabled} label="合并式主页（实验）" onChange={(next) => onConfigure({ hubHome: next })} />
+          <Toggle checked={config.hubHome ?? true} detail="Claude 正在小范围试验的主页布局：对话和 Cowork 合在一个输入框里，没有「对话 | Cowork」切换。默认开；关掉改用有切换的经典主页" disabled={disabled} label="合并式主页（实验）" onChange={(next) => onConfigure({ hubHome: next })} />
         )}
         <Toggle
           checked={config.localization}

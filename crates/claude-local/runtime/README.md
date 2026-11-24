@@ -30,7 +30,7 @@ Claude 安装包。代理、证书、缓存和会话数据由 Codex++ 放在独�
 | `CLAUDE_LOCAL_COWORK` | Cowork 总开关（GrowthBook `yukon_silver`），默认开，`0` 时按录制模板里 Claude 自己的值 |
 | `CLAUDE_LOCAL_COWORK_PROMPT_FILE` | 覆盖 Cowork 系统提示词的文件；不设时从本机 `app.asar` 读，读不到用内置兜底文案 |
 | `CLAUDE_LOCAL_TEMPLATE` | 录制版用哪个录制版本（`mock/<build>/` 的目录名，即前端 build id）；不设或已下架时用最新的（按页面外壳的 `data-build-timestamp`） |
-| `CLAUDE_LOCAL_HUB_HOME` | 只认 `1`：用 Claude 的合并式主页（GrowthBook `claude_ai_hub_web_delivery`，对话和 Cowork 合在一个输入框里）。默认用有「对话 \| Cowork」切换的经典主页：关掉这个开关，并从 `gated_imports` 里去掉它的代码 |
+| `CLAUDE_LOCAL_HUB_HOME` | 只认 `1`：用 Claude 的合并式主页（GrowthBook `claude_ai_hub_web_delivery`，对话和 Cowork 合在一个输入框里）。不设时用有「对话 \| Cowork」切换的经典主页：关掉这个开关，并从 `gated_imports` 里去掉它的代码。设置里的「合并式主页」默认开，启动本地服务时传 `1` |
 
 受管启动支持 `--port 0`，监听后写入
 `{instanceId,pid,port,mode,lastClientAt}` 回执，不包含网关凭据。

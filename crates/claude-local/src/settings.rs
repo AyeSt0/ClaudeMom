@@ -15,7 +15,7 @@ pub struct ClaudeLocalSettings {
     /// 打开 Cowork 的总开关（GrowthBook `yukon_silver`，默认开）。录制模板里它是关的，
     /// 新版 Claude 会因此只显示 Chat / Code。平台限制（MSIX、HCS 等）仍由 Claude 自己检查。
     pub cowork: bool,
-    /// 用 Claude 的合并式主页（GrowthBook `claude_ai_hub_web_delivery`，默认关）：对话和 Cowork 合在一个输入框里，
+    /// 用 Claude 的合并式主页（GrowthBook `claude_ai_hub_web_delivery`，默认开）：对话和 Cowork 合在一个输入框里，
     /// 没有「对话 | Cowork」切换。录制模板的账号在这个实验组里，关着时改回有切换的经典主页。
     pub hub_home: bool,
     /// 录制版用哪个录制版本（前端 build id）。空串或已经下架的版本按最新的。
@@ -60,7 +60,7 @@ impl Default for ClaudeLocalSettings {
             background_mode: false,
             force_background_mode: false,
             cowork: true,
-            hub_home: false,
+            hub_home: true,
             template: String::new(),
             three_p_mode: false,
             display_name: String::new(),
