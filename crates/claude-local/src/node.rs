@@ -83,10 +83,40 @@ fn program_candidates(name: &str) -> Vec<PathBuf> {
         dirs.push(PathBuf::from("/usr/local/bin"));
         dirs.push(PathBuf::from("/usr/bin"));
     }
+    if cfg!(windows) {
+        dirs.extend(windows_install_dirs(|name| std::env::var_os(name)));
+    }
     dirs.into_iter()
         .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .filter(|path| path.is_file())
         .collect()
+}
+
+/// Windows 上常见的 Node 安装目录，排在 PATH 后面。
+///
+/// 进程的 PATH 是它启动时继承的：本程序（或拉起它的常驻进程）先于 Node 启动时，
+/// 安装器后来写进注册表的 PATH 这里看不到，终端里 `node -v` 正常、这里却说没装（Codex++ #3291）。
+/// fnm 之类只在 shell 里改 PATH 的版本管理器也一样。
+pub fn windows_install_dirs(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let dir = |name: &str| var(name).map(PathBuf::from).filter(|path| path.is_absolute());
+    let mut dirs = Vec::new();
+    // nvm-windows 把当前版本链接到 NVM_SYMLINK（默认就是 Program Files\nodejs）。
+    dirs.extend(dir("NVM_SYMLINK"));
+    for root in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        dirs.extend(dir(root).map(|root| root.join("nodejs")));
+    }
+    if let Some(local) = dir("LOCALAPPDATA") {
+        dirs.push(local.join("Volta").join("bin"));
+        dirs.push(local.join("Programs").join("nodejs"));
+    }
+    if let Some(roaming) = dir("APPDATA") {
+        dirs.push(roaming.join("fnm").join("aliases").join("default"));
+    }
+    if let Some(home) = dir("USERPROFILE") {
+        dirs.push(home.join("scoop").join("apps").join("nodejs").join("current"));
+        dirs.push(home.join("scoop").join("apps").join("nodejs-lts").join("current"));
+    }
+    dirs
 }
 
 #[cfg(test)]
@@ -113,5 +143,26 @@ mod tests {
         );
         // 没装 Node 时才退回其它 App 自带的。
         assert_eq!(ordered_candidates(None, vec![], vec![bundled.clone()]), vec![bundled]);
+    }
+
+    #[test]
+    fn windows_install_dirs_cover_installers_that_only_update_the_registry_path() {
+        // 用 / 开头的路径代替盘符，在非 Windows 上也算绝对路径。
+        let env = |name: &str| -> Option<std::ffi::OsString> {
+            match name {
+                "ProgramFiles" => Some("/pf".into()),
+                "LOCALAPPDATA" => Some("/local".into()),
+                "APPDATA" => Some("/roaming".into()),
+                "USERPROFILE" => Some("relative-is-ignored".into()),
+                _ => None,
+            }
+        };
+        let dirs = windows_install_dirs(env);
+        assert_eq!(dirs[0], PathBuf::from("/pf").join("nodejs"));
+        assert!(dirs.contains(&PathBuf::from("/local").join("Volta").join("bin")));
+        assert!(dirs.contains(&PathBuf::from("/roaming").join("fnm").join("aliases").join("default")));
+        // 没设置或不是绝对路径的变量不产生候选。
+        assert!(!dirs.iter().any(|dir| dir.starts_with("relative-is-ignored")));
+        assert_eq!(dirs.len(), 4);
     }
 }
